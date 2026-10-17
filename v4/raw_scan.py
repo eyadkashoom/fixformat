@@ -1,0 +1,1699 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+raw_scan.py - raw sector signature scanner (READ-ONLY, fully offline).
+
+What it does
+------------
+1. Lists every disk in the machine with its exact size and sector count, then
+   ASKS which target to scan (physical disk / volume / image file).
+2. Reads the target raw, in large blocks, and searches byte-by-byte inside the
+   memory for the configured signatures, reporting the EXACT byte offset and
+   the sector number of every hit (signatures crossing block boundaries are
+   never missed - an overlap window is carried between blocks).
+3. Every hit is printed, appended immediately to search_results.txt, and
+   carved out to a data window so the surrounding content can be read back.
+4. When the scan ends, a report shows every recovered item (name + size +
+   totals) and the candidate file names found inside the carved data, and then
+   ASKS where the recovered data should be saved - nothing is assumed about
+   the destination.
+
+Signatures
+----------
+* MAGIC_SIGNATURES  - magic bytes of binary formats (PDF, PNG, ZIP, ...)
+* TARGET_SIGNATURES - plain-text keywords and file-extension strings for text
+  formats that have no magic bytes (.md, .py, .json, .yaml, .env, ...)
+
+Text signatures are searched in several encodings (UTF-8, UTF-16LE, UTF-16BE),
+so non-ASCII content (e.g. Arabic words) is found whatever encoding the file
+was saved with. Case sensitivity is controlled by CASE_SENSITIVE.
+
+Environment
+-----------
+Mini Windows 10 (DLC Boot) from a USB flash drive. The bundled embedded
+Python (python\\python.exe) runs this with no installation. Only the Python
+standard library is used - no pip, no network, no internet connection needed.
+
+This tool NEVER writes to the scanned device.
+"""
+
+import ctypes
+import hashlib
+import os
+import re
+import shutil
+import sys
+import time
+from datetime import datetime
+
+IS_WINDOWS = os.name == "nt"
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+SECTOR_SIZE = 512          # used for the sector counters
+DEVICE_ALIGNMENT = 4096    # Windows raw-device reads must be aligned to this
+GB = 1024.0 ** 3
+VERSION = "4.0"
+
+# Every text signature is searched in all of these encodings.
+TEXT_ENCODINGS = ("utf-8", "utf-16-le", "utf-16-be")
+
+# Candidate file names carved out of recovered data (report section).
+NAME_RE = re.compile(
+    r"[A-Za-z0-9_\-\.]{2,80}\.(?:md|py|json|ya?ml|env|txt|log|toml|cfg|ini|bat|ps1|sql|csv|sh)\b")
+
+
+# ----------------------------------------------------------------------
+# small helpers
+# ----------------------------------------------------------------------
+
+def fmt_bytes(n):
+    n = float(n)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024.0 or unit == "TB":
+            return "%d B" % int(n) if unit == "B" else "%.2f %s" % (n, unit)
+        n /= 1024.0
+
+
+def fmt_int(n):
+    return format(int(n), ",")
+
+
+def fmt_hms(seconds):
+    seconds = int(max(0, seconds))
+    return "%02d:%02d:%02d" % (seconds // 3600, (seconds % 3600) // 60, seconds % 60)
+
+
+def parse_hex_pattern(text):
+    """Accept '25 50 44 46', '25504446', '\\x25\\x50', '0x25 0x50' forms."""
+    cleaned = (
+        text.replace(" ", "").replace("\t", "").replace("\n", "").replace("\r", "")
+            .replace(",", "").replace(":", "")
+            .replace("0x", "").replace("0X", "")
+            .replace("\\x", "").replace("\\X", "")
+    )
+    if len(cleaned) == 0 or len(cleaned) % 2 != 0:
+        raise ValueError("Invalid hex pattern (need an even number of hex digits): %r" % (text,))
+    try:
+        return bytes.fromhex(cleaned)
+    except ValueError:
+        raise ValueError("Invalid hex pattern: %r" % (text,))
+
+
+def _ext_from_label(label):
+    """'Python Code (.py)' -> 'py';  'Extension .md' -> 'md';  else 'bin'."""
+    m = re.search(r"\(\.([A-Za-z0-9]+)\)", label) or re.search(r"\.([A-Za-z0-9]+)$", label)
+    return m.group(1).lower() if m else "bin"
+
+
+def expand_text_signature(label, text, ext):
+    """One text signature -> one entry per encoding (label gains [encoding])."""
+    if isinstance(text, bytes):
+        return [(label, text, ext)]
+    if not text:
+        raise ValueError("Empty text signature: %r" % (label,))
+    entries = []
+    seen = set()
+    for enc in TEXT_ENCODINGS:
+        try:
+            raw = text.encode(enc)
+        except UnicodeEncodeError:
+            continue
+        if raw and raw not in seen:
+            seen.add(raw)
+            entries.append(("%s [%s]" % (label, enc), raw, ext))
+    if not entries:
+        raise ValueError("Text signature cannot be encoded: %r" % (label,))
+    return entries
+
+
+def build_patterns(case_sensitive=None):
+    """Config dicts -> (label, pattern_bytes, ext, case_insensitive) tuples."""
+    if case_sensitive is None:
+        case_sensitive = CASE_SENSITIVE
+    patterns = []
+    for label, value in MAGIC_SIGNATURES.items():
+        pat = value if isinstance(value, bytes) else parse_hex_pattern(value)
+        patterns.append((label, pat, _ext_from_label(label), False))
+    for label, value in TARGET_SIGNATURES.items():
+        ext = _ext_from_label(label)
+        ci = not case_sensitive
+        for lab, pat, e in expand_text_signature(label, value, ext):
+            patterns.append((lab, pat, e, ci))
+    if not patterns:
+        raise ValueError("No signatures configured - edit MAGIC_SIGNATURES / TARGET_SIGNATURES.")
+    return patterns
+
+
+# ----------------------------------------------------------------------
+# interactive choices (v2)
+# ----------------------------------------------------------------------
+
+def available_extensions(patterns):
+    """{'md': [labels...], 'py': [...], ...}"""
+    exts = {}
+    for entry in patterns:
+        exts.setdefault(entry[2], []).append(entry[0])
+    return exts
+
+
+def filter_patterns_by_extension(patterns, extensions):
+    """Keep only patterns whose extension is in `extensions` (None/empty = keep all)."""
+    if not extensions:
+        return list(patterns)
+    return [entry for entry in patterns if entry[2] in extensions]
+
+
+def ask_extensions(patterns):
+    """Ask which file extensions to search for. Returns a set like {'md','py'}."""
+    exts = available_extensions(patterns)
+    ordered = sorted(exts.keys())
+    print("Available file extensions (with the number of signatures each one uses):")
+    for i, e in enumerate(ordered, 1):
+        print("  %2d) .%-8s %2d signature(s)" % (i, e, len(exts[e])))
+    print()
+    print("Type the numbers you want separated by commas (example: 1,3,5),")
+    print("or type 'all' to search for every extension listed above.")
+    while True:
+        try:
+            answer = input("Your choice [all]: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            answer = "all"
+        if not answer or answer.lower() in ("all", "a", "*"):
+            return set(ordered)
+        picked = set()
+        bad = False
+        for token in answer.replace(" ", "").split(","):
+            if not token:
+                continue
+            if not token.isdigit() or not (1 <= int(token) <= len(ordered)):
+                bad = True
+                break
+            picked.add(ordered[int(token) - 1])
+        if bad or not picked:
+            print("Invalid input. Use numbers from the list (e.g. 1,3,5) or 'all'.")
+            continue
+        return picked
+
+
+def ask_case_sensitive():
+    """Ask Y/N whether the search must respect letter case. Returns True/False."""
+    print("Case sensitivity decides whether uppercase and lowercase letters must")
+    print("match exactly, or are treated as the same letter.")
+    print("  Y = case-sensitive, exact match (recommended, fewer false hits)")
+    print("      example: API_KEY= matches 'API_KEY=' but not 'api_key='")
+    print("  N = case-insensitive (finds more, but also more false hits)")
+    print("      example: API_KEY= also matches 'api_key=' and 'Api_Key='")
+    while True:
+        try:
+            answer = input("Your choice [Y]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            answer = "y"
+        if answer in ("", "y", "yes"):
+            return True
+        if answer in ("n", "no"):
+            return False
+        print("Please answer Y or N.")
+
+
+def confirm_start():
+    """Y/N confirmation before the scan starts. Returns True to start."""
+    print("Do you want to start the scan now?")
+    print("  Y = yes, start scanning")
+    print("  N = no, stop here (nothing is scanned or changed)")
+    while True:
+        try:
+            answer = input("Your choice [y/N]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            answer = "n"
+        if answer in ("y", "yes"):
+            return True
+        if answer in ("", "n", "no"):
+            return False
+        print("Please answer Y or N.")
+
+
+# ----------------------------------------------------------------------
+# device access
+# ----------------------------------------------------------------------
+
+def read_exact(f, length):
+    """Read exactly `length` bytes or fewer at EOF (handles partial reads)."""
+    buf = bytearray()
+    while len(buf) < length:
+        piece = f.read(length - len(buf))
+        if not piece:
+            break
+        buf += piece
+    return bytes(buf)
+
+
+def read_window(f, start, end):
+    """Read bytes [start, end) respecting raw-device alignment rules."""
+    if end <= start:
+        return b""
+    a_start = (start // DEVICE_ALIGNMENT) * DEVICE_ALIGNMENT
+    a_end = ((end + DEVICE_ALIGNMENT - 1) // DEVICE_ALIGNMENT) * DEVICE_ALIGNMENT
+    saved = f.tell()
+    try:
+        f.seek(a_start)
+        data = read_exact(f, a_end - a_start)
+    finally:
+        f.seek(saved)
+    s = start - a_start
+    return data[s:min(s + (end - start), len(data))]
+
+
+def get_device_size(f):
+    """Total size in bytes of a device/file; 0 when unknown."""
+    if IS_WINDOWS:
+        try:
+            import msvcrt
+            from ctypes import wintypes
+
+            class GET_LENGTH_INFORMATION(ctypes.Structure):
+                _fields_ = [("Length", ctypes.c_longlong)]
+
+            kernel32 = ctypes.windll.kernel32
+            handle = msvcrt.get_osfhandle(f.fileno())
+            IOCTL_DISK_GET_LENGTH_INFO = 0x0007405C
+            info = GET_LENGTH_INFORMATION()
+            ret = wintypes.DWORD(0)
+            ok = kernel32.DeviceIoControl(
+                wintypes.HANDLE(handle),
+                IOCTL_DISK_GET_LENGTH_INFO,
+                None, 0,
+                ctypes.byref(info), ctypes.sizeof(info),
+                ctypes.byref(ret), None,
+            )
+            if ok:
+                return int(info.Length)
+        except Exception:
+            pass
+    try:
+        f.seek(0, os.SEEK_END)
+        size = f.tell()
+        f.seek(0)
+        return size
+    except OSError:
+        return 0
+
+
+def list_physical_drives(max_index=16):
+    """[(index, size_bytes), ...] for every accessible physical disk."""
+    drives = []
+    for i in range(max_index):
+        target = "\\\\.\\PhysicalDrive%d" % i
+        try:
+            f = open(target, "rb", buffering=0)
+        except (PermissionError, OSError):
+            continue
+        try:
+            drives.append((i, get_device_size(f)))
+        finally:
+            f.close()
+    return drives
+
+
+def list_logical_drives():
+    """[(root, total_bytes, free_bytes), ...] for every mounted volume."""
+    out = []
+    for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
+        root = letter + ":\\"
+        if not os.path.exists(root):
+            continue
+        try:
+            usage = shutil.disk_usage(root)
+            out.append((root, usage.total, usage.free))
+        except OSError:
+            out.append((root, 0, 0))
+    return out
+
+
+# ----------------------------------------------------------------------
+# signature scanning
+# ----------------------------------------------------------------------
+
+def _reportable(last_hit, label, abs_off, min_gap):
+    """MIN_GAP filter: True = report this hit, False = too close to the previous one."""
+    prev = last_hit.get(label)
+    if min_gap and prev is not None and (abs_off - prev) < min_gap:
+        return False
+    last_hit[label] = abs_off
+    return True
+
+
+
+def shannon_entropy(data):
+    """Shannon entropy in bits/byte for `data` (0..8)."""
+    if not data:
+        return 0.0
+    from collections import Counter
+    counts = Counter(data)
+    n = len(data)
+    ent = 0.0
+    for c in counts.values():
+        p = c / n
+        if p > 0:
+            import math
+            ent -= p * math.log2(p)
+    return ent
+
+
+def printable_ratio(data):
+    """Fraction of bytes that are printable ASCII or common whitespace."""
+    if not data:
+        return 0.0
+    printable = sum(1 for b in data if (32 <= b < 127) or b in (9, 10, 13))
+    return printable / len(data)
+
+
+def classify_window(data):
+    """Return (label, entropy) for a carved window.
+
+    TEXT (readable)        - high printable ratio
+    BINARY (structured)    - low entropy with structure
+    COMPRESSED/ENCRYPTED   - entropy > ~6.5
+    ZERO (empty)           - all zeros
+    """
+    if not data:
+        return ("ZERO (empty)", 0.0)
+    if is_all_zeros(data):
+        return ("ZERO (empty)", 0.0)
+    ent = shannon_entropy(data)
+    pr = printable_ratio(data)
+    if ent > 6.5:
+        return ("COMPRESSED/ENCRYPTED", ent)
+    if pr >= 0.60:
+        return ("TEXT (readable)", ent)
+    return ("BINARY (structured)", ent)
+
+
+def is_text_like_byte(b):
+    """True if byte is plausible in a text file."""
+    return (32 <= b < 127) or b in (9, 10, 13) or b >= 0x80
+
+
+def smart_extend_text(f, start, initial_end, total_size, max_extra=1024*1024):
+    """Extend a carved text window while data looks like readable text.
+
+    Returns the new end offset (exclusive). Stops when a run of non-text bytes
+    exceeds a small threshold or max_extra is reached.
+    """
+    end = initial_end
+    if total_size:
+        hard_limit = min(total_size, initial_end + max_extra)
+    else:
+        hard_limit = initial_end + max_extra
+    # read in 4KB steps
+    step = 4096
+    bad_run = 0
+    while end < hard_limit:
+        to_read = min(step, hard_limit - end)
+        if to_read <= 0:
+            break
+        try:
+            chunk = read_window(f, end, end + to_read)
+        except Exception:
+            break
+        if not chunk:
+            break
+        # count text-like bytes in this chunk
+        textish = sum(1 for b in chunk if is_text_like_byte(b))
+        if textish / len(chunk) < 0.70:
+            # too much binary; stop, but allow a short tail
+            bad_run += 1
+            if bad_run >= 2:
+                break
+        else:
+            bad_run = 0
+        end += len(chunk)
+        if len(chunk) < to_read:
+            break
+    return end
+
+
+def carve_window(f, abs_off, plen, total_size, carve_dir, label, ext, before, after,
+                 smart_text=False, triage=True):
+    """Dump a data window around a hit into carve_dir. Returns the path or ''.
+
+    v4: optional smart text extension + carved-window triage classification.
+    Writes a .txt copy next to text windows and a .triage.txt sidecar.
+    """
+    try:
+        start = max(0, abs_off - before)
+        end = abs_off + plen + after
+        if total_size:
+            end = min(end, total_size)
+        # smart text carving: extend while data looks like readable text
+        if smart_text and ext in ("md", "py", "json", "yaml", "yml", "env", "txt", "log",
+                                  "toml", "cfg", "ini", "csv", "sh", "bat", "ps1", "sql"):
+            end = smart_extend_text(f, start, end, total_size)
+            if total_size:
+                end = min(end, total_size)
+        data = read_window(f, start, end)
+        if not data:
+            return ""
+        os.makedirs(carve_dir, exist_ok=True)
+        safe = "".join(ch if (ch.isalnum() or ch in "-_") else "_" for ch in label)
+        fname = "%s_0x%016X.%s" % (safe, abs_off, ext or "bin")
+        path = os.path.join(carve_dir, fname)
+        with open(path, "wb") as out:
+            out.write(data)
+        # triage classification
+        if triage:
+            cls, ent = classify_window(data)
+            try:
+                with open(path + ".triage.txt", "w", encoding="utf-8") as tf:
+                    tf.write("classification : %s\n" % cls)
+                    tf.write("entropy        : %.3f bits/byte\n" % ent)
+                    tf.write("printable      : %.1f%%\n" % (printable_ratio(data) * 100))
+                    tf.write("size           : %d bytes\n" % len(data))
+                    tf.write("offset         : 0x%016X\n" % abs_off)
+                    tf.write("sector         : %d\n" % (abs_off // SECTOR_SIZE))
+            except OSError:
+                pass
+        # write a clean readable .txt copy for text windows
+        if ext in ("md", "py", "json", "yaml", "yml", "env", "txt", "log",
+                   "toml", "cfg", "ini", "csv", "sh", "bat", "ps1", "sql"):
+            try:
+                text = data.decode("utf-8", errors="replace")
+                txt_path = os.path.join(carve_dir, "%s_0x%016X.txt" % (safe, abs_off))
+                with open(txt_path, "w", encoding="utf-8", errors="replace") as tf:
+                    tf.write(text)
+            except OSError:
+                pass
+        return path
+    except OSError as exc:
+        return "(carve failed: %s)" % exc
+
+
+def scan(target, patterns, chunk_size, results_path, carve_dir=None,
+         carve_before=4096, carve_after=65536, show_progress=True,
+         min_gap=0, carve_limit=0):
+    """
+    Scan `target` for `patterns` = (label, bytes, ext, case_insensitive) tuples.
+    Returns a summary dict (see below).
+    """
+    if not patterns:
+        raise ValueError("patterns must not be empty")
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be positive")
+
+    is_device = IS_WINDOWS and target.startswith("\\\\.\\")
+    if is_device and chunk_size % DEVICE_ALIGNMENT != 0:
+        raise ValueError("For raw devices chunk_size must be a multiple of %d" % DEVICE_ALIGNMENT)
+
+    pat_list = []
+    for entry in patterns:
+        label, pat, ext = entry[0], entry[1], entry[2]
+        ci = entry[3] if len(entry) > 3 else False
+        pat_list.append((label, pat, ext, ci, pat.lower() if ci else pat))
+
+    max_len = max(len(p[1]) for p in pat_list)
+    carry_len = max_len - 1
+    any_ci = any(p[3] for p in pat_list)
+
+    hits = []
+    counts = dict((p[0], 0) for p in pat_list)
+    carved_counts = {}
+    scanned = 0
+    interrupted = False
+    started = time.time()
+
+    def now():
+        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    log_file = open(results_path, "a", encoding="utf-8", errors="replace")
+
+    def log(line):
+        log_file.write(line + "\n")
+        log_file.flush()
+
+    log("=== SCAN START %s ===" % now())
+    log("target     : %s" % target)
+    log("chunk size : %d bytes" % chunk_size)
+    log("patterns   : %d" % len(pat_list))
+    log("min gap    : %d bytes" % min_gap)
+    log("case       : %s" % ("sensitive" if not any_ci else "insensitive for text signatures"))
+
+    # may raise PermissionError / OSError - handled by main()
+    f = open(target, "rb", buffering=0)
+    try:
+        total_size = get_device_size(f)
+        log("target size: %s" % ("unknown" if not total_size else "%d bytes (%s)"
+                                 % (total_size, fmt_bytes(total_size))))
+
+        carry = b""
+        next_off = 0
+        last_hit = {}
+        last_progress = [0.0]
+
+        def update_progress(force=False):
+            if not show_progress:
+                return
+            t = time.time()
+            if not force and (t - last_progress[0]) < 1.0:
+                return
+            last_progress[0] = t
+            elapsed = t - started
+            rate = scanned / elapsed if elapsed > 0 else 0
+            if total_size:
+                pct = 100.0 * scanned / total_size
+                remaining = max(0, total_size - scanned)
+                eta = remaining / rate if rate > 0 else 0
+                line = ("\rScanned %s / %s (%.2f%%) | sectors %s / %s | remaining %s | ETA %s | hits %d"
+                        % (fmt_bytes(scanned), fmt_bytes(total_size), pct,
+                           fmt_int(scanned // SECTOR_SIZE), fmt_int(total_size // SECTOR_SIZE),
+                           fmt_bytes(remaining), fmt_hms(eta), len(hits)))
+            else:
+                line = ("\rScanned %s | sectors %s | speed %s/s | hits %d"
+                        % (fmt_bytes(scanned), fmt_int(scanned // SECTOR_SIZE),
+                           fmt_bytes(rate), len(hits)))
+            sys.stdout.write(line)
+            sys.stdout.flush()
+
+        try:
+            while True:
+                chunk = read_exact(f, chunk_size)
+                if not chunk:
+                    break
+
+                combined = carry + chunk
+                combined_lower = combined.lower() if any_ci else None
+                base = next_off - len(carry)
+                carry_floor = len(carry)
+
+                for label, pat, ext, ci, pat_low in pat_list:
+                    needle = pat_low if ci else pat
+                    hay = combined_lower if ci else combined
+                    plen = len(pat)
+                    pos = hay.find(needle)
+                    while pos != -1:
+                        if pos + plen > carry_floor and _reportable(last_hit, label, base + pos, min_gap):
+                            abs_off = base + pos
+                            sector = abs_off // SECTOR_SIZE
+                            carved_path = ""
+                            carved_ok = (carve_dir and
+                                         (not carve_limit or carved_counts.get(label, 0) < carve_limit))
+                            if carved_ok:
+                                carved_path = carve_window(
+                                    f, abs_off, plen, total_size, carve_dir,
+                                    label, ext, carve_before, carve_after,
+                                    smart_text=ENABLE_SMART_TEXT, triage=ENABLE_TRIAGE)
+                                if carved_path and not carved_path.startswith("(carve failed"):
+                                    carved_counts[label] = carved_counts.get(label, 0) + 1
+                            elif carve_dir:
+                                carved_path = "(carve limit reached)"
+                            hits.append({"label": label, "offset": abs_off,
+                                         "sector": sector, "carved": carved_path})
+                            counts[label] += 1
+                            line = ("[%s] HIT | %s | offset=0x%016X (dec %d) | sector=%d | carved=%s"
+                                    % (now(), label, abs_off, abs_off, sector, carved_path or "-"))
+                            log(line)
+                            print("\n" + line)
+                        pos = hay.find(needle, pos + 1)
+
+                scanned += len(chunk)
+                next_off += len(chunk)
+                update_progress()
+
+                if len(chunk) < chunk_size:
+                    break
+                carry = combined[-carry_len:] if carry_len else b""
+        except KeyboardInterrupt:
+            interrupted = True
+
+        update_progress(force=True)
+        if show_progress:
+            print()
+
+        elapsed = time.time() - started
+        log("=== SCAN END %s === status=%s" % (now(), "INTERRUPTED" if interrupted else "COMPLETE"))
+        log("bytes scanned: %d" % scanned)
+        log("sectors      : %d" % (scanned // SECTOR_SIZE))
+        log("elapsed      : %s" % fmt_hms(elapsed))
+        log("hits total   : %d" % len(hits))
+        for entry in pat_list:
+            log("  %-40s %d" % (entry[0], counts[entry[0]]))
+
+        return {
+            "target": target,
+            "total_size": total_size,
+            "bytes_scanned": scanned,
+            "elapsed": elapsed,
+            "hits": hits,
+            "counts": counts,
+            "interrupted": interrupted,
+            "results_path": results_path,
+            "carve_dir": carve_dir,
+        }
+    finally:
+        f.close()
+        log_file.close()
+
+
+# ----------------------------------------------------------------------
+# report + save-to destination
+# ----------------------------------------------------------------------
+
+def extract_candidate_names(carve_dir, limit=400):
+    """File-name-like strings found inside the carved windows: [(name, count)]."""
+    found = {}
+    if not carve_dir or not os.path.isdir(carve_dir):
+        return []
+    for fname in sorted(os.listdir(carve_dir)):
+        path = os.path.join(carve_dir, fname)
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "rb") as fh:
+                data = fh.read(256 * 1024)
+        except OSError:
+            continue
+        for text in (data.decode("latin-1", errors="ignore"),
+                     data.decode("utf-16-le", errors="ignore"),
+                     data.decode("utf-16-be", errors="ignore")):
+            for m in NAME_RE.finditer(text):
+                name = m.group(0)
+                found[name] = found.get(name, 0) + 1
+        if len(found) > limit * 4:
+            break
+    return sorted(found.items(), key=lambda kv: (-kv[1], kv[0]))[:limit]
+
+
+def carved_stats(carve_dir):
+    """(file_count, total_bytes, [(filename, size), ...])"""
+    items = []
+    total = 0
+    if carve_dir and os.path.isdir(carve_dir):
+        for fname in sorted(os.listdir(carve_dir)):
+            path = os.path.join(carve_dir, fname)
+            if os.path.isfile(path):
+                size = os.path.getsize(path)
+                total += size
+                items.append((fname, size))
+    return len(items), total, items
+
+
+
+
+def write_index_html(summary, names, report_dir, index_path):
+    """Write a browsable index.html listing recovered items."""
+    carve_dir = summary.get("carve_dir") or ""
+    items = []
+    if carve_dir and os.path.isdir(carve_dir):
+        for fname in sorted(os.listdir(carve_dir)):
+            path = os.path.join(carve_dir, fname)
+            if not os.path.isfile(path):
+                continue
+            if fname.endswith(".triage.txt"):
+                continue
+            if fname.endswith(".txt"):
+                continue
+            size = os.path.getsize(path)
+            triage = ""
+            tp = path + ".triage.txt"
+            if os.path.isfile(tp):
+                try:
+                    with open(tp, "r", encoding="utf-8", errors="replace") as fh:
+                        triage = fh.read()
+                except OSError:
+                    triage = ""
+            cls = ""
+            ent = ""
+            for line in triage.splitlines():
+                if line.startswith("classification"):
+                    cls = line.split(":", 1)[-1].strip()
+                if line.startswith("entropy"):
+                    ent = line.split(":", 1)[-1].strip()
+            items.append((fname, size, cls, ent))
+    rows = []
+    for fname, size, cls, ent in items:
+        color = "#2e7d32" if str(cls).startswith("TEXT") else ("#c62828" if str(cls).startswith("COMPRESSED") else ("#616161" if str(cls).startswith("ZERO") else "#1565c0"))
+        rows.append("<tr><td>%s</td><td>%s</td><td style='color:%s'>%s</td><td>%s</td></tr>" % (fname, fmt_bytes(size), color, cls or "-", ent or "-"))
+    html = []
+    html.append("<!DOCTYPE html>")
+    html.append("<html><head><meta charset='utf-8'><title>fixformat recovery index</title>")
+    html.append("<style>body{font-family:Segoe UI,Arial,sans-serif;margin:20px;background:#fafafa;color:#222}")
+    html.append("table{border-collapse:collapse;width:100%}th,td{border:1px solid #ccc;padding:6px 10px;text-align:left}")
+    html.append("th{background:#eee} h1{color:#1565c0}</style></head><body>")
+    html.append("<h1>fixformat v%s - recovery index</h1>" % VERSION)
+    html.append("<p>target: %s<br>bytes scanned: %s<br>hits: %d<br>recovered files: %d</p>" % (summary.get("target", ""), fmt_bytes(summary.get("bytes_scanned", 0)), len(summary.get("hits", [])), len(items)))
+    html.append("<table><tr><th>file</th><th>size</th><th>classification</th><th>entropy</th></tr>")
+    html.append("".join(rows))
+    html.append("</table>")
+    if names:
+        html.append("<h2>Candidate file names</h2><ul>")
+        for name, cnt in names:
+            html.append("<li>%s (x%d)</li>" % (name, cnt))
+        html.append("</ul>")
+    html.append("</body></html>")
+    try:
+        with open(index_path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(html))
+        return True
+    except OSError:
+        return False
+
+
+
+def write_report(summary, names, report_path):
+    count, total, items = carved_stats(summary["carve_dir"])
+    lines = []
+    lines.append("=== RECOVERY REPORT ===")
+    lines.append("date          : %s" % datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    lines.append("target        : %s" % summary["target"])
+    if summary["total_size"]:
+        lines.append("target size   : %d bytes (%s)" % (summary["total_size"], fmt_bytes(summary["total_size"])))
+    lines.append("bytes scanned : %d" % summary["bytes_scanned"])
+    lines.append("sectors       : %d" % (summary["bytes_scanned"] // SECTOR_SIZE))
+    lines.append("elapsed       : %s" % fmt_hms(summary["elapsed"]))
+    lines.append("status        : %s" % ("INTERRUPTED" if summary["interrupted"] else "COMPLETE"))
+    lines.append("hits total    : %d" % len(summary["hits"]))
+    lines.append("")
+    lines.append("--- hits per pattern ---")
+    for label in summary["counts"]:
+        lines.append("  %-40s %d" % (label, summary["counts"][label]))
+    lines.append("")
+    lines.append("--- recovered items (carved data windows) ---")
+    lines.append("  %-12s %-40s %-18s %-10s %s" % ("offset", "pattern", "sector", "size", "file"))
+    for rec in summary["hits"]:
+        path = rec.get("carved") or ""
+        size = os.path.getsize(path) if path and os.path.isfile(path) else 0
+        lines.append("  0x%010X %-40s %-18s %-10s %s"
+                     % (rec["offset"], rec["label"], fmt_int(rec["sector"]),
+                        fmt_int(size), os.path.basename(path) or "-"))
+    lines.append("")
+    lines.append("recovered files : %d" % count)
+    lines.append("recovered total : %d bytes (%s)" % (total, fmt_bytes(total)))
+    lines.append("")
+    lines.append("--- candidate file names found in recovered data ---")
+    if names:
+        for name, cnt in names:
+            lines.append("  %-60s x%d" % (name, cnt))
+    else:
+        lines.append("  (none)")
+    with open(report_path, "w", encoding="utf-8", errors="replace") as fh:
+        fh.write("\n".join(lines) + "\n")
+    return count, total
+
+
+def print_report(summary, names):
+    count, total, items = carved_stats(summary["carve_dir"])
+    print()
+    print("=== SCAN SUMMARY ===")
+    print("target        : %s" % summary["target"])
+    if summary["total_size"]:
+        print("target size   : %s (%d bytes, %s sectors)"
+              % (fmt_bytes(summary["total_size"]), summary["total_size"],
+                 fmt_int(summary["total_size"] // SECTOR_SIZE)))
+    print("bytes scanned : %s (%d bytes)" % (fmt_bytes(summary["bytes_scanned"]), summary["bytes_scanned"]))
+    print("sectors       : %s" % fmt_int(summary["bytes_scanned"] // SECTOR_SIZE))
+    print("elapsed       : %s" % fmt_hms(summary["elapsed"]))
+    print("status        : %s" % ("INTERRUPTED (partial results kept)" if summary["interrupted"] else "COMPLETE"))
+    print("hits total    : %d" % len(summary["hits"]))
+    print("recovered     : %d files, %s (%d bytes)"
+          % (count, fmt_bytes(total), total))
+    print()
+    print("--- hits per pattern ---")
+    for label in summary["counts"]:
+        print("  %-40s %d" % (label, summary["counts"][label]))
+    print()
+    print("--- recovered items (first 50, full list in recovery_report.txt) ---")
+    for rec in summary["hits"][:50]:
+        path = rec.get("carved") or ""
+        size = os.path.getsize(path) if path and os.path.isfile(path) else 0
+        print("  0x%016X  sector %-12s %-8s %s"
+              % (rec["offset"], fmt_int(rec["sector"]), fmt_bytes(size),
+                 os.path.basename(path) or rec["label"]))
+    if len(summary["hits"]) > 50:
+        print("  ... %d more" % (len(summary["hits"]) - 50))
+    print()
+    print("--- candidate file names found in recovered data (first 30) ---")
+    for name, cnt in names[:30]:
+        print("  %-60s x%d" % (name, cnt))
+    if len(names) > 30:
+        print("  ... %d more (full list in recovery_report.txt)" % (len(names) - 30))
+    if not names:
+        print("  (none found)")
+
+
+def ask_save_location(work_dir):
+    """Ask where to keep the recovered data and move it there. Returns final dir."""
+    print()
+    print("Where should the recovered data be saved permanently?")
+    print("Type a folder path on a DIFFERENT disk than the scanned one - writing")
+    print("onto the damaged disk can overwrite the very data you want to recover.")
+    print("Press Enter to keep everything in the current folder.")
+    while True:
+        try:
+            answer = input("Destination folder [keep in %s]: " % work_dir).strip()
+        except (EOFError, KeyboardInterrupt):
+            answer = ""
+        if not answer:
+            print("Recovered data kept in: %s" % work_dir)
+            return work_dir
+        dest_root = os.path.abspath(os.path.expanduser(answer.strip('"')))
+        try:
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            dest = os.path.join(dest_root, "recovered_" + stamp)
+            os.makedirs(dest, exist_ok=True)
+            return dest
+        except OSError as exc:
+            print("Cannot use %s: %s" % (dest_root, exc))
+
+
+# ----------------------------------------------------------------------
+# main
+# ----------------------------------------------------------------------
+
+def open_target(target):
+    f = open(target, "rb", buffering=0)   # may raise PermissionError / OSError
+    try:
+        size = get_device_size(f)
+    finally:
+        f.close()
+    return size
+
+
+def ask_target():
+    print("Physical disks in this machine:")
+    drives = list_physical_drives()
+    if drives:
+        for idx, size in drives:
+            print("  [%2d] \\\\.\\PhysicalDrive%-2d  %10.2f GB  %14s sectors  (%d bytes)"
+                  % (idx, idx, size / GB, fmt_int(size // SECTOR_SIZE), size))
+    else:
+        print("  (none accessible - run as Administrator / SYSTEM)")
+    print("Logical volumes:")
+    for root, total, free in list_logical_drives():
+        print("  %-6s %10.2f GB total, %10.2f GB free" % (root, total / GB, free / GB))
+    print()
+    while True:
+        try:
+            answer = input("Scan which target? drive number (e.g. 0), letter (e.g. D), or image file path: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None, 0
+        answer = answer.strip('"').strip("'")
+        if not answer:
+            continue
+        if answer.isdigit():
+            target = "\\\\.\\PhysicalDrive%s" % answer
+        elif len(answer) == 1 and answer.isalpha():
+            target = "\\\\.\\%s:" % answer.upper()
+        elif len(answer) == 2 and answer[1] == ":" and answer[0].isalpha():
+            target = "\\\\.\\%s:" % answer[0].upper()
+        else:
+            target = os.path.abspath(os.path.expanduser(answer))
+            if not os.path.isfile(target):
+                print("File not found: %s" % target)
+                continue
+        try:
+            size = open_target(target)
+        except PermissionError:
+            print("Access denied opening %s - run as Administrator." % target)
+            continue
+        except OSError as exc:
+            print("Cannot open %s: %s" % (target, exc))
+            continue
+        return target, size
+
+
+def run_search_flow(target, total):
+    """Menu options 1 and 3: choose signatures, confirm, scan, report, save."""
+    print()
+    print("Selected target : %s" % target)
+    if total:
+        print("Size            : %s (%d bytes, %s sectors)"
+              % (fmt_bytes(total), total, fmt_int(total // SECTOR_SIZE)))
+    else:
+        print("Size            : unknown (will scan until end of media)")
+
+    # ---------------- STEP 2 ----------------
+    print()
+    print("=" * 78)
+    print("STEP 2 of 5 - CHOOSE WHICH FILE TYPES TO SEARCH FOR")
+    print("=" * 78)
+    print("Search for one file extension or several. Every extension brings its")
+    print("own signatures: magic bytes for binary formats, content keywords and")
+    print("extension strings for text formats (.md, .py, .json ...).")
+    print()
+    try:
+        exts = ask_extensions(build_patterns())
+    except ValueError as exc:
+        print("CONFIG ERROR: %s" % exc)
+        sys.exit(2)
+
+    # ---------------- STEP 3 ----------------
+    print()
+    print("=" * 78)
+    print("STEP 3 of 5 - CHOOSE CASE SENSITIVITY")
+    print("=" * 78)
+    case_sensitive = ask_case_sensitive()
+    patterns = filter_patterns_by_extension(build_patterns(case_sensitive), exts)
+
+    # ---------------- STEP 4 ----------------
+    print()
+    print("=" * 78)
+    print("STEP 4 of 5 - CONFIRM YOUR CHOICES")
+    print("=" * 78)
+    print("  target      : %s (%s)" % (target, fmt_bytes(total) if total else "size unknown"))
+    print("  extensions  : %s" % ", ".join("." + e for e in sorted(exts)))
+    print("  signatures  : %d patterns will be searched" % len(patterns))
+    print("  case        : %s" % ("sensitive (exact match)" if case_sensitive else "insensitive (ignore case)"))
+    print("  read block  : %s" % fmt_bytes(CHUNK_SIZE))
+    print()
+    print("Scanning is read-only: nothing on the disk is modified.")
+    print("Recovered data is collected in : %s" % SCRIPT_DIR)
+    print("After the scan you will be asked where to save it permanently.")
+    print()
+    if not confirm_start():
+        print("Stopped. Nothing was scanned.")
+        sys.exit(0)
+
+    # ---------------- STEP 5 ----------------
+    print()
+    print("=" * 78)
+    print("STEP 5 of 5 - SCANNING (this can take a long time on big disks)")
+    print("=" * 78)
+    print("The progress line shows: data scanned / total (percent) | sectors")
+    print("scanned / total | data remaining | estimated time left | hits found.")
+    print("Every hit is saved to search_results.txt the moment it is found.")
+    print("Press Ctrl+C to stop early - everything found so far is kept.")
+    print("-" * 78)
+
+    results_path = os.path.join(SCRIPT_DIR, RESULTS_FILE)
+    carve_dir = os.path.join(SCRIPT_DIR, CARVE_DIR) if ENABLE_CARVING else None
+
+    try:
+        summary = scan(target, patterns, CHUNK_SIZE, results_path, carve_dir,
+                       CARVE_BEFORE, CARVE_AFTER, min_gap=MIN_GAP,
+                       carve_limit=CARVE_LIMIT)
+    except PermissionError:
+        print("\nERROR: access denied.")
+        print("Raw device reads require administrator / SYSTEM rights.")
+        print("Re-open the command prompt as Administrator and retry.")
+        sys.exit(3)
+    except ValueError as exc:
+        print("\nCONFIG ERROR: %s" % exc)
+        sys.exit(2)
+    except OSError as exc:
+        print("\nERROR: %s" % exc)
+        sys.exit(1)
+
+    # ---------------- RESULTS ----------------
+    print()
+    print("=" * 78)
+    print("RESULTS - RECOVERY REPORT")
+    print("=" * 78)
+    print("Below is everything that was found: each hit with its exact byte")
+    print("offset and sector, the recovered data files and their sizes, the")
+    print("totals, and the candidate file names inside the recovered data.")
+    print()
+    names = extract_candidate_names(carve_dir)
+    report_path = os.path.join(SCRIPT_DIR, REPORT_FILE)
+    count, total_bytes = write_report(summary, names, report_path)
+    index_path = os.path.join(SCRIPT_DIR, "index.html")
+    if ENABLE_INDEX_HTML:
+        if write_index_html(summary, names, SCRIPT_DIR, index_path):
+            print("index (html)    : %s" % index_path)
+    print_report(summary, names)
+    print()
+    print("results log     : %s" % results_path)
+    print("recovery report : %s" % report_path)
+
+    # ask WHERE to save, after the user has seen names and sizes
+    final_dir = ask_save_location(SCRIPT_DIR)
+    if final_dir != SCRIPT_DIR:
+        try:
+            if carve_dir and os.path.isdir(carve_dir):
+                shutil.move(carve_dir, os.path.join(final_dir, "carved"))
+            for src in (results_path, report_path, index_path):
+                if os.path.isfile(src):
+                    shutil.copy2(src, os.path.join(final_dir, os.path.basename(src)))
+                if os.path.isfile(src):
+                    shutil.copy2(src, os.path.join(final_dir, os.path.basename(src)))
+            count, total_bytes, _ = carved_stats(os.path.join(final_dir, "carved"))
+            print()
+            print("SAVED TO: %s" % final_dir)
+            print("  recovered files : %d" % count)
+            print("  recovered total : %s (%d bytes)" % (fmt_bytes(total_bytes), total_bytes))
+        except OSError as exc:
+            print("Move failed: %s - files remain in %s" % (exc, SCRIPT_DIR))
+    if not summary["hits"]:
+        print()
+        print("No matches found. Review TARGET_SIGNATURES / MAGIC_SIGNATURES")
+        print("in raw_scan.py and run the scan again.")
+
+
+# ----------------------------------------------------------------------
+# disk imaging (v3)
+# ----------------------------------------------------------------------
+
+def ask_image_file():
+    """Ask for an existing disk image file. Returns (path, size) or (None, 0)."""
+    while True:
+        try:
+            answer = input("Path of the disk image file to analyze (.img): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None, 0
+        answer = answer.strip('"').strip("'")
+        if not answer:
+            continue
+        path = os.path.abspath(os.path.expanduser(answer))
+        if not os.path.isfile(path):
+            print("File not found: %s" % path)
+            continue
+        return path, os.path.getsize(path)
+
+
+import ctypes
+
+def get_volume_fs(path):
+    """Return the file-system name (e.g. 'NTFS', 'exFAT', 'FAT32') for path."""
+    if not IS_WINDOWS:
+        return ""
+    try:
+        kernel32 = ctypes.windll.kernel32
+        target = os.path.abspath(path if os.path.isdir(path) else (os.path.dirname(path) or "."))
+        buf = ctypes.create_unicode_buffer(1024)
+        ok = kernel32.GetVolumePathNameW(target, buf, 1024)
+        root = buf.value if ok else ""
+        if not root:
+            drive = os.path.splitdrive(target)[0]
+            root = (drive + "\\") if drive else ""
+        fs = ctypes.create_unicode_buffer(260)
+        ok2 = kernel32.GetVolumeInformationW(root, None, 0, None, None, None, fs, 260)
+        return fs.value if ok2 else ""
+    except Exception:
+        return ""
+
+
+def set_sparse_file(f):
+    """Mark an open file handle as a sparse file (Windows NTFS). Returns True on success."""
+    if not IS_WINDOWS:
+        return False
+    try:
+        from ctypes import wintypes
+        import msvcrt
+        kernel32 = ctypes.windll.kernel32
+        h = msvcrt.get_osfhandle(f.fileno())
+        ret = wintypes.DWORD(0)
+        FSCTL_SET_SPARSE = 0x000900C4
+        ok = kernel32.DeviceIoControl(
+            wintypes.HANDLE(h), FSCTL_SET_SPARSE,
+            None, 0, None, 0, ctypes.byref(ret), None)
+        return bool(ok)
+    except Exception:
+        return False
+
+
+def is_all_zeros(chunk):
+    """True when chunk consists entirely of zero bytes."""
+    if not chunk:
+        return True
+    return chunk == b"\x00" * len(chunk)
+
+
+def ask_imaging_mode():
+    """Ask which image format to use. Returns one of: raw, sparse, gzip, xz, zstd."""
+    print("Choose the image format:")
+    print("  1) Raw (.img)            - default, uncompressed, universal compatibility.")
+    print("  2) NTFS Sparse (.img)    - recommended on NTFS: all-zero sectors take no disk space, file still reads back complete.")
+    print("  3) gzip (.img.gz)        - stream-compressed (stdlib gzip, low level for speed). Fallback for non-NTFS.")
+    print("  4) xz (.img.xz)          - stream-compressed (stdlib lzma).")
+    print("  5) zstd (.img.zst)       - requires an external 'zstd' binary on PATH.")
+    print()
+    while True:
+        try:
+            answer = input("Your choice [1]: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return "raw"
+        if answer in ("", "1"):
+            return "raw"
+        if answer == "2":
+            return "sparse"
+        if answer == "3":
+            return "gzip"
+        if answer == "4":
+            return "xz"
+        if answer == "5":
+            return "zstd"
+        print("Please type 1, 2, 3, 4 or 5.")
+
+def ask_image_destination(source_size, suggested_name):
+    """Ask where to save a new disk image; checks the free space first."""
+    print("The image file will be as large as the disk itself.")
+    print("Choose a folder (or a full .img path) on a disk with ENOUGH FREE SPACE")
+    print("- never on the disk you are imaging.")
+    print()
+    print("Free space on the mounted volumes:")
+    for root, total, free in list_logical_drives():
+        print("  %-6s %10.2f GB free of %10.2f GB" % (root, free / GB, total / GB))
+    print()
+    need = int(source_size * 1.02) if source_size else 0
+    while True:
+        try:
+            answer = input("Where to save the image? folder or full file path (.img): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+        answer = answer.strip('"').strip("'")
+        if not answer:
+            continue
+        path = os.path.abspath(os.path.expanduser(answer))
+        if os.path.isdir(path):
+            path = os.path.join(path, suggested_name)
+        parent = os.path.dirname(path) or "."
+        if not os.path.isdir(parent):
+            print("Folder does not exist: %s" % parent)
+            continue
+        try:
+            free = shutil.disk_usage(parent).free
+        except OSError as exc:
+            print("Cannot read the free space of %s: %s" % (parent, exc))
+            continue
+        if need and free < need:
+            print("NOT ENOUGH FREE SPACE: the image needs about %s but %s has only %s free."
+                  % (fmt_bytes(need), parent, fmt_bytes(free)))
+            continue
+        if os.path.exists(path):
+            try:
+                answer2 = input("%s already exists. Overwrite? [y/N]: " % path).strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                answer2 = "n"
+            if answer2 not in ("y", "yes"):
+                continue
+        return path
+
+
+def create_disk_image(source, dest, chunk_size, show_progress=True, mode="raw"):
+    """
+    Copy every byte of `source` (raw device or file) into `dest`, computing a
+    SHA-256 checksum while copying. Returns a summary dict:
+      source, dest, source_size, copied, sha256, elapsed, interrupted, verified.
+    On failure or interruption the partial file is renamed to `<dest>.partial`
+    so it is never mistaken for a complete image. A `<dest>.info.txt` sidecar
+    with the checksum and sizes is written next to the image.
+
+    mode: raw | sparse | gzip | xz | zstd
+    """
+    is_device = IS_WINDOWS and source.startswith("\\\\.\\")
+    if is_device and chunk_size % DEVICE_ALIGNMENT != 0:
+        raise ValueError("For raw devices chunk_size must be a multiple of %d" % DEVICE_ALIGNMENT)
+
+    # normalize destination extension per mode
+    ext_map = {"raw": "", "sparse": "", "gzip": ".gz", "xz": ".xz", "zstd": ".zst"}
+    suffix = ext_map.get(mode, "")
+    if suffix and not dest.lower().endswith(suffix):
+        dest = dest + suffix
+
+    if mode == "zstd":
+        import shutil as _sh
+        if not _sh.which("zstd"):
+            raise ValueError("zstd mode requires the 'zstd' executable on PATH (not found)")
+
+    started = time.time()
+    hasher = hashlib.sha256()
+    copied = 0
+    interrupted = False
+    total_size_ref = [0]
+    last_progress = [0.0]
+
+    def update_progress(force=False):
+        if not show_progress:
+            return
+        t = time.time()
+        if not force and (t - last_progress[0]) < 1.0:
+            return
+        last_progress[0] = t
+        elapsed = t - started
+        rate = copied / elapsed if elapsed > 0 else 0
+        if total_size_ref[0]:
+            pct = 100.0 * copied / total_size_ref[0]
+            remaining = max(0, total_size_ref[0] - copied)
+            eta = remaining / rate if rate > 0 else 0
+            line = ("\\rImaging: %s / %s (%.2f%%) | sectors %s / %s | speed %s/s | ETA %s"
+                    % (fmt_bytes(copied), fmt_bytes(total_size_ref[0]), pct,
+                       fmt_int(copied // SECTOR_SIZE), fmt_int(total_size_ref[0] // SECTOR_SIZE),
+                       fmt_bytes(rate), fmt_hms(eta)))
+        else:
+            line = ("\\rImaging: %s copied | sectors %s | speed %s/s"
+                    % (fmt_bytes(copied), fmt_int(copied // SECTOR_SIZE), fmt_bytes(rate)))
+        sys.stdout.write(line)
+        sys.stdout.flush()
+
+    f = open(source, "rb", buffering=0)   # may raise PermissionError / OSError
+    try:
+        total_size_ref[0] = get_device_size(f)
+        out = None
+        proc = None
+        try:
+            if mode in ("raw", "sparse"):
+                out = open(dest, "wb")
+                if mode == "sparse":
+                    if get_volume_fs(dest) != "NTFS":
+                        raise ValueError("NTFS Sparse requires an NTFS destination (detected: %s)"
+                                         % (get_volume_fs(dest) or "unknown"))
+                    if not set_sparse_file(out):
+                        raise ValueError("Failed to mark destination as a sparse file (NTFS required)")
+            elif mode == "gzip":
+                import gzip as _gz
+                out = _gz.open(dest, "wb", compresslevel=3)
+            elif mode == "xz":
+                import lzma as _lz
+                out = _lz.open(dest, "wb", format=_lz.FORMAT_XZ, check=_lz.CHECK_CRC64, preset=1)
+            elif mode == "zstd":
+                import subprocess as _sp
+                import shutil as _sh
+                zbin = _sh.which("zstd")
+                proc = _sp.Popen([zbin, "-q", "-o", dest, "-"], stdin=_sp.PIPE)
+                out = proc.stdin
+            else:
+                raise ValueError("unknown imaging mode: %s" % mode)
+
+            while True:
+                chunk = read_exact(f, chunk_size)
+                if not chunk:
+                    break
+                if mode == "sparse" and is_all_zeros(chunk):
+                    # create a hole (no disk space consumed) instead of writing zeros
+                    try:
+                        out.seek(len(chunk), os.SEEK_CUR)
+                    except (OSError, IOError):
+                        out.write(chunk)
+                else:
+                    out.write(chunk)
+                hasher.update(chunk)
+                copied += len(chunk)
+                update_progress()
+                if len(chunk) < chunk_size:
+                    break
+            if out is not None:
+                try:
+                    out.flush()
+                except Exception:
+                    pass
+            if proc is not None:
+                try:
+                    out.close()
+                except Exception:
+                    pass
+                out = None
+                rc = proc.wait()
+                if rc != 0:
+                    raise RuntimeError("zstd exited with code %d" % rc)
+            if mode in ("raw", "sparse", "gzip", "xz") and out is not None:
+                try:
+                    out.close()
+                except Exception:
+                    pass
+                out = None
+            if mode in ("raw", "sparse"):
+                try:
+                    with open(dest, "r+b") as _fh:
+                        _fh.seek(0, os.SEEK_END)
+                        if _fh.tell() < copied:
+                            _fh.seek(copied - 1)
+                            _fh.write(b"\x00")
+                            _fh.flush()
+                        os.fsync(_fh.fileno())
+                except OSError:
+                    pass
+        except KeyboardInterrupt:
+            interrupted = True
+        except BaseException:
+            if out is not None:
+                try:
+                    out.close()
+                except Exception:
+                    pass
+            try:
+                os.replace(dest, dest + ".partial")
+            except OSError:
+                pass
+            raise
+        finally:
+            if out is not None:
+                try:
+                    out.close()
+                except Exception:
+                    pass
+            if proc is not None:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
+        update_progress(force=True)
+        if show_progress:
+            print()
+        if interrupted:
+            partial = dest + ".partial"
+            try:
+                os.replace(dest, partial)
+                dest = partial
+            except OSError:
+                pass
+
+        elapsed = time.time() - started
+        verified = (not total_size_ref[0]) or (copied == total_size_ref[0])
+        summary = {
+            "source": source, "dest": dest,
+            "source_size": total_size_ref[0], "copied": copied,
+            "sha256": hasher.hexdigest(), "elapsed": elapsed,
+            "interrupted": interrupted, "verified": verified,
+            "mode": mode,
+        }
+        try:
+            with open(dest + ".info.txt", "w", encoding="utf-8") as fh:
+                fh.write("disk image created by raw_scan.py v%s\n" % VERSION)
+                fh.write("date        : %s\n" % datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                fh.write("source      : %s\n" % source)
+                fh.write("mode        : %s\n" % mode)
+                fh.write("source size : %d bytes (%s sectors)\n"
+                         % (total_size_ref[0], fmt_int(total_size_ref[0] // SECTOR_SIZE)))
+                fh.write("copied      : %d bytes (%s sectors)\n"
+                         % (copied, fmt_int(copied // SECTOR_SIZE)))
+                fh.write("verified    : %s\n" % ("yes" if verified else "NO"))
+                fh.write("sha256      : %s\n" % summary["sha256"])
+                fh.write("elapsed     : %s\n" % fmt_hms(elapsed))
+                fh.write("status      : %s\n" % ("INTERRUPTED" if interrupted else "COMPLETE"))
+        except OSError:
+            pass
+        return summary
+    finally:
+        f.close()
+
+def run_imaging_flow():
+    """Menu option 2: create a full image of a disk in one fast read."""
+    print("=" * 78)
+    print("STEP 1 of 5 - CHOOSE THE DISK TO IMAGE")
+    print("=" * 78)
+    print("The disk is read ONE time, at maximum speed, and copied into a single")
+    print("image file. Nothing on the disk is modified.")
+    print()
+    if TARGET.strip():
+        target = TARGET.strip()
+        try:
+            total = open_target(target)
+        except PermissionError:
+            print("ERROR: access denied opening %s - run as Administrator." % target)
+            sys.exit(3)
+        except OSError as exc:
+            print("ERROR: %s" % exc)
+            sys.exit(1)
+    else:
+        target, total = ask_target()
+        if not target:
+            print("No target selected. Nothing was done.")
+            sys.exit(0)
+
+    print()
+    print("Selected target : %s" % target)
+    if total:
+        print("Size            : %s (%d bytes, %s sectors)"
+              % (fmt_bytes(total), total, fmt_int(total // SECTOR_SIZE)))
+    else:
+        print("Size            : unknown (will copy until end of media)")
+
+    print()
+    print("=" * 78)
+    print("STEP 2 of 5 - CHOOSE THE IMAGE FORMAT")
+    print("=" * 78)
+    mode = ask_imaging_mode()
+    print("Selected format : %s" % mode)
+    print()
+
+    print("=" * 78)
+    print("STEP 3 of 5 - CHOOSE WHERE TO SAVE THE IMAGE")
+    print("=" * 78)
+    safe = re.sub(r"[^A-Za-z0-9]+", "_", target.replace("\\\\.\\", ""))[:40]
+    suggested = "diskimage_%s_%s.img" % (safe, datetime.now().strftime("%Y%m%d_%H%M%S"))
+    dest = ask_image_destination(total, suggested)
+    if not dest:
+        print("No destination selected. Nothing was done.")
+        sys.exit(0)
+
+    print()
+    print("=" * 78)
+    print("STEP 4 of 5 - CONFIRM YOUR CHOICES")
+    print("=" * 78)
+    print("  source       : %s" % target)
+    print("  source size  : %s" % (fmt_bytes(total) if total else "unknown"))
+    print("  format       : %s" % mode)
+    print("  image file   : %s" % dest)
+    print("  read block   : %s" % fmt_bytes(IMAGE_CHUNK_SIZE))
+    print()
+    print("The image is written directly to the destination above (no second")
+    print("copy). A SHA-256 checksum is computed while copying and saved next to")
+    print("the image in a .info.txt file.")
+    print()
+    if not confirm_start():
+        print("Stopped. Nothing was done.")
+        sys.exit(0)
+
+    print()
+    print("=" * 78)
+    print("STEP 5 of 5 - IMAGING (one fast read of the disk)")
+    print("=" * 78)
+    print("The progress line shows: copied / total (percent) | sectors copied /")
+    print("total | speed | estimated time left. Press Ctrl+C to stop early - the")
+    print("partial file is renamed to *.partial so it is never mistaken for a")
+    print("complete image.")
+    print("-" * 78)
+
+    try:
+        summary = create_disk_image(target, dest, IMAGE_CHUNK_SIZE, mode=mode)
+    except PermissionError:
+        print("\nERROR: access denied.")
+        print("Raw device reads require administrator / SYSTEM rights.")
+        sys.exit(3)
+    except ValueError as exc:
+        print("\nCONFIG ERROR: %s" % exc)
+        sys.exit(2)
+    except OSError as exc:
+        print("\nERROR: %s" % exc)
+        print("If the destination disk is full, free some space or choose another")
+        print("destination and run again.")
+        sys.exit(1)
+
+    print()
+    print("=== IMAGING RESULT ===")
+    print("  image file   : %s" % summary["dest"])
+    print("  copied       : %s (%d bytes, %s sectors)"
+          % (fmt_bytes(summary["copied"]), summary["copied"],
+             fmt_int(summary["copied"] // SECTOR_SIZE)))
+    if summary["source_size"]:
+        print("  source size  : %s (%d bytes)"
+              % (fmt_bytes(summary["source_size"]), summary["source_size"]))
+        print("  verified     : %s"
+              % ("YES - copied size matches the source"
+                 if summary["verified"] else "NO - sizes differ, run the imaging again"))
+    print("  sha256       : %s" % summary["sha256"])
+    print("  elapsed      : %s" % fmt_hms(summary["elapsed"]))
+    print("  status       : %s"
+          % ("INTERRUPTED - file kept as %s" % summary["dest"] if summary["interrupted"]
+             else "COMPLETE"))
+    print("  info file    : %s" % (summary["dest"] + ".info.txt"))
+    if not summary["interrupted"]:
+        print()
+        print("Next step: run this tool again and choose option 3 to analyze the")
+        print("image - the original disk will not be touched again.")
+
+
+def main():
+    print("raw_scan.py v%s - raw sector signature scanner and disk imager" % VERSION)
+    print("          (read-only for every disk it reads, fully offline)")
+    print("script dir : %s" % SCRIPT_DIR)
+    print()
+    print("This tool never writes to the disk it reads. Every step below is")
+    print("explained on screen and asks you what to do.")
+    print()
+    print("=" * 78)
+    print("MAIN MENU - CHOOSE WHAT TO DO")
+    print("=" * 78)
+    print("  1 - SEARCH A DISK FOR FILE SIGNATURES")
+    print("      Reads a disk once and reports every match right away.")
+    print()
+    print("  2 - CREATE A FULL IMAGE OF A DISK  (recommended first step)")
+    print("      Copies every byte of the disk into one .img file in a single")
+    print("      fast pass. The disk hardware is read only once; the image can")
+    print("      then be analyzed again and again without stressing the disk.")
+    print()
+    print("  3 - ANALYZE AN EXISTING DISK IMAGE")
+    print("      Searches an image file (created by option 2, or any .img)")
+    print("      for file signatures and recovers data from it.")
+    print()
+    print("Best practice: run option 2 first, then option 3 on the created image.")
+    print()
+    while True:
+        try:
+            choice = input("Your choice [1/2/3]: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            print("No choice made. Nothing was done.")
+            sys.exit(0)
+        if choice in ("1", "2", "3"):
+            break
+        print("Please type 1, 2 or 3.")
+    print()
+    if choice == "2":
+        run_imaging_flow()
+        return
+    if choice == "3":
+        print("=" * 78)
+        print("STEP 1 of 5 - CHOOSE THE DISK IMAGE TO ANALYZE")
+        print("=" * 78)
+        print("Type the path of the image file created by option 2 (a .img file).")
+        print("Analyzing an image does not touch the original disk at all.")
+        print()
+        target, total = ask_image_file()
+        if not target:
+            print("No image selected. Nothing was scanned.")
+            sys.exit(0)
+    else:
+        print("=" * 78)
+        print("STEP 1 of 5 - CHOOSE THE DISK TO SCAN")
+        print("=" * 78)
+        print("The machine may contain several disks. Every disk is listed below with")
+        print("its exact size and sector count so you can identify the right one.")
+        print()
+        if TARGET.strip():
+            target = TARGET.strip()
+            try:
+                total = open_target(target)
+            except PermissionError:
+                print("ERROR: access denied opening %s - run as Administrator." % target)
+                sys.exit(3)
+            except OSError as exc:
+                print("ERROR: %s" % exc)
+                sys.exit(1)
+        else:
+            target, total = ask_target()
+            if not target:
+                print("No target selected. Nothing was scanned.")
+                sys.exit(0)
+    run_search_flow(target, total)
+
+
+# ======================================================================
+# USER CONFIGURATION - edit the values below, then run the script.
+# ======================================================================
+
+# Leave TARGET empty to be asked interactively (recommended: the script lists
+# every disk with its size and sector count, then asks which one to scan).
+# Set it to skip the question, e.g. r"\\.\PhysicalDrive0" or r"\\.\D:".
+TARGET = ""
+
+# Read block size. Large blocks keep the scan fast; the byte-level search
+# inside them stays exact (signatures crossing block boundaries are caught by
+# an overlap window). For raw devices it must be a multiple of 4096
+# (512 / 4096 / 8 MiB style sizes are all fine as long as they are).
+CHUNK_SIZE = 8 * 1024 * 1024
+
+# Read block size for imaging (menu option 2). The disk is read once, so big
+# blocks maximize sustained throughput. Must be a multiple of 4096 for raw
+# devices.
+IMAGE_CHUNK_SIZE = 8 * 1024 * 1024
+
+# Ignore a new hit of the same pattern closer than this to the previous one
+# (generic markers like "{" or "# " occur thousands of times in one region and
+# one carved window already covers it). Set 0 to report every occurrence.
+MIN_GAP = 1024 * 1024
+
+# Case sensitivity for the text signatures in TARGET_SIGNATURES.
+# True  = "API_KEY=" matches "API_KEY=" only (max precision)
+# False = "API_KEY=" also matches "api_key=" (max recall)
+CASE_SENSITIVE = True
+
+# Logs (created next to the script during the scan, moved on request later).
+RESULTS_FILE = "search_results.txt"
+REPORT_FILE = "recovery_report.txt"
+
+# Carve a readable data window around every hit.
+ENABLE_CARVING = True
+# v4: extend carved text windows while data looks like readable text.
+ENABLE_SMART_TEXT = True
+# v4: classify each carved window (TEXT/BINARY/COMPRESSED/ZERO) via entropy.
+ENABLE_TRIAGE = True
+# v4: write an index.html (browsable) next to the report.
+ENABLE_INDEX_HTML = True
+CARVE_DIR = "recovered"
+CARVE_BEFORE = 4096            # bytes kept before the hit
+CARVE_AFTER = 64 * 1024        # bytes kept after the hit
+CARVE_LIMIT = 100              # max carved files per pattern (0 = unlimited)
+
+# Magic-byte signatures: label -> hex bytes (or bytes). Binary formats with a
+# fixed, well-known header. Add more whenever you need them.
+MAGIC_SIGNATURES = {
+    "PDF document (.pdf)": "25 50 44 46 2D",
+    "PNG image (.png)": "89 50 4E 47 0D 0A 1A 0A",
+    "JPEG image (.jpg)": "FF D8 FF",
+    "GIF image (.gif)": "47 49 46 38",
+    "ZIP archive (.zip)": "50 4B 03 04",
+    "RAR archive (.rar)": "52 61 72 21 1A 07 00",
+    "7z archive (.7z)": "37 7A BC AF 27 1C",
+    "GZIP file (.gz)": "1F 8B 08",
+    "SQLite database (.db)": "53 51 4C 69 74 65 20 66 6F 72 6D 61 74 20 33 00",
+}
+
+# Text signatures: label -> exact text (str, searched in UTF-8 + UTF-16LE +
+# UTF-16BE, or raw bytes used as-is). Text formats have no magic bytes, so
+# they are found by keywords and file-extension strings; extension strings
+# also appear inside NTFS MFT records where file names live, so a ".md" hit
+# there usually reveals the real file name in the carved window.
+# NOTE: very generic markers ("{", "# ") match huge amounts of unrelated data.
+# Longer, more specific markers give better precision.
+TARGET_SIGNATURES = {
+    # --- plain-text keywords (examples, not exhaustive) ---
+    "Python Code (.py)": "import ",
+    "Python shebang (.py)": "#!/usr/bin/env python",
+    "Python def (.py)": "def ",
+    "Environment (.env)": "API_KEY=",
+    "YAML Config (.yaml)": "agent:",
+    "JSON Data (.json)": '":',
+    "Markdown heading LF (.md)": "\n# ",
+    "Markdown heading CRLF (.md)": "\r\n# ",
+    # --- file extension strings ---
+    "Extension .md": ".md",
+    "Extension .py": ".py",
+    "Extension .json": ".json",
+    "Extension .yaml": ".yaml",
+    "Extension .yml": ".yml",
+    "Extension .env": ".env",
+    "Extension .txt": ".txt",
+    "Extension .log": ".log",
+    "Extension .toml": ".toml",
+    "Extension .cfg": ".cfg",
+    "Extension .ini": ".ini",
+    "Extension .bat": ".bat",
+    "Extension .ps1": ".ps1",
+    "Extension .sql": ".sql",
+    "Extension .csv": ".csv",
+    "Extension .codex": ".codex",
+    "Path marker /codex (.codex)": "/codex",
+    "Folder marker Codex (.codex)": "Codex",
+    "Hermes marker (.txt)": "Hermes",
+    # --- project file names ---
+    "Name PROJECT_SPEC (.md)": "PROJECT_SPEC",
+    "Name DECISIONS (.md)": "DECISIONS",
+    "Name WORK_PLAN (.md)": "WORK_PLAN",
+    "Name SESSION_STATE (.md)": "SESSION_STATE",
+    "Name ACTIVITY_LOG (.md)": "ACTIVITY_LOG",
+    "Name SALVAGED_TECHNIQUES (.md)": "SALVAGED_TECHNIQUES",
+    "Name SOURCE_LAYOUT (.md)": "SOURCE_LAYOUT",
+    "Name smart-file-organizer (.md)": "smart-file-organizer",
+    "Name AGENT_OPERATING_RULES (.md)": "AGENT_OPERATING_RULES",
+}
+
+# ======================================================================
+
+if __name__ == "__main__":
+    main()

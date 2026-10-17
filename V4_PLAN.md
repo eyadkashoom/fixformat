@@ -32,7 +32,10 @@ very well.
   losslessly (sparse / gzip). Any zero-skip must be bit-transparent: the
   image must read back identical to the source.
 
-## 3. Full NTFS MFT-based recovery (the headline v4 feature)
+## 3. Full NTFS MFT-based recovery (EXCLUDED from v4)
+
+Excluded by user decision: "هذا لن نقوم به" (we will not do this).
+This item stays in the backlog for a possible future version.
 
 Turn the tool from a signature detector into a real file recoverer:
 
@@ -81,8 +84,13 @@ Report the classification per window and keep only the TEXT ones as
 browsable output. This turns thousands of garbage files into a filtered
 shortlist.
 
-## Decisions still needed from the user
+## Decisions recorded (v4)
 
-- Approve the three-way imaging choice (Raw / NTFS Sparse / gzip)?
-- Is the affected disk HDD or SSD (sets recovery expectations)?
-- Ship the embedded Python as a Release asset (proposal 6)?
+- Imaging compression: user chooses at imaging time among Raw / NTFS Sparse /
+  gzip / xz / zstd (zstd requires external binary).
+- Never skip unallocated space: enforced as design rule (no $Bitmap exclusion).
+- Full MFT recovery: EXCLUDED (see section 3).
+- Smart text carving: enabled.
+- Organized output + browsable index: index.html.
+- GitHub Release with embedded Python: enabled (python-embed.zip attached).
+- Carved-window triage (entropy + type): enabled.

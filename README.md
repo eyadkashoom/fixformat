@@ -203,3 +203,8 @@ internet needed.
   `.info.txt` sidecar, `*.partial` safety rename on failure), and **analyze a
   disk image** (file carving on the image). Recommended workflow: image
   first, then analyze the image repeatedly without touching the hardware.
+- **v4.0.0** - Release 4: imaging compression choice (Raw / NTFS Sparse /
+  gzip / xz / zstd), never-skip-unallocated-space design rule, smart text
+  carving (extend while readable), carved-window triage (entropy + type:
+  TEXT/BINARY/COMPRESSED/ZERO), organized output with browsable index.html,
+  GitHub Release with embedded Python.
