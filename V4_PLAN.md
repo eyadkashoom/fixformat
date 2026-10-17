@@ -65,6 +65,22 @@ Attach `python-embed.zip` (embeddable Python) to a GitHub Release on the
 latest tag so users get the complete bootable-folder kit in one download.
 (Pending user decision - third-party redistributable, PSF license allows it.)
 
+## 7. Carved-window triage (new - based on real recovered samples)
+
+Recovered samples show that many carved windows are high-entropy binary
+noise (measured: entropy ~6.3 bits/byte, 0.3% printable characters, no
+magic bytes, no zero runs) - remnants of compressed/encrypted data, not
+readable files. Every carved window should be classified automatically:
+
+- `TEXT (readable)` - high printable ratio -> extract and save readable runs
+- `BINARY (structured)` - low entropy with structure (FS remnants, runlists)
+- `COMPRESSED/ENCRYPTED` - entropy > ~6.5 -> not browsable, likely dead
+- `ZERO (empty)` - all zeros -> never written or TRIMed
+
+Report the classification per window and keep only the TEXT ones as
+browsable output. This turns thousands of garbage files into a filtered
+shortlist.
+
 ## Decisions still needed from the user
 
 - Approve the three-way imaging choice (Raw / NTFS Sparse / gzip)?
