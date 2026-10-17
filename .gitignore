@@ -1,0 +1,14 @@
+# Third-party runtime - not part of the source.
+# Download it separately (see README.md "Embedded Python" section).
+python/
+python-embed.zip
+
+# Run-time output of the scanner
+recovered/
+search_results.txt
+recovery_report.txt
+*.img
+
+# Python
+__pycache__/
+*.pyc
