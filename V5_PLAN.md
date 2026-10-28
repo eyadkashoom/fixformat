@@ -312,13 +312,22 @@ blocks, serving every window from the block in memory. Thousands of random
 back-seeks become one sequential pass. It also lets the user review the hit
 index before committing disk space to extracted files.
 
-**13.2 One C-level pass per block (anchor sieve)**
-Build the set of *first bytes* of all patterns, scan each block once with a
-single-character-class `re` (C level) to get candidate positions only, then
-try the patterns that start with that byte. Typical disk content contains
-almost none of the anchors, so matching cost collapses instead of running 40
-full `find` passes. A pure-alternation `re` over all patterns is the fallback
-for long patterns; `bytes.find` stays for single short patterns.
+**13.2 One C-level pass per block - MEASURED AND REJECTED**
+Three candidate matchers were built and benchmarked on one 8 MB block of the
+fixture with the 117-pattern default set:
+
+| Matcher | Time for one 8 MB block | Verdict |
+|---------|------------------------|---------|
+| plain `bytes.find()` per pattern (v4 behaviour) | **1.3 s** | fastest - kept |
+| single `re` alternation of all 117 needles | 5.4 s | 4x slower, rejected |
+| anchor-byte-class sieve + `startswith` verification | 6.7 s | 5x slower, rejected |
+
+Reason: `bytes.find()` is a C-level search with a skip table, while the
+"clever" matchers push one Python-level iteration per candidate byte position
+(7.5 million of them on a zero-heavy block, because UTF-16-BE patterns begin
+with `0x00`). The lesson is recorded here so no later session re-implements
+the slow variants. The real wins on data-dense blocks are 13.5 (parallel
+matching) and 13.7 (far fewer signatures), not a fancier matcher.
 
 **13.3 Zero-region fast skip + TRIM reporting**
 Compare each block against a cached zero block (C-level `memcmp`); equal ->
@@ -358,6 +367,12 @@ markers must be at least 8 characters, and the active signature set is
 whatever the JSON profile (Section 7) selects. Fewer hits = dramatically less
 carving.
 
+First measured step, already implemented: UTF-16-BE expansion is now opt-in
+(`SEARCH_UTF16_BE = False`). Windows writes UTF-16-LE, so the BE patterns only
+added cost - every one of them begins with `0x00`, the most common byte on a
+formatted disk, and they accounted for ~25 ms of every 8 MB block each. The
+default set dropped from 117 to 81 patterns with no loss of reachable content.
+
 **13.8 Measured acceptance criteria** (not claims)
 Build a 2 GB synthetic image (70% zeros, 30% random, planted hits) and record
 MB/s and seconds for: v4 baseline -> after 13.1 -> after 13.2/13.3 -> after
@@ -365,6 +380,21 @@ MB/s and seconds for: v4 baseline -> after 13.1 -> after 13.2/13.3 -> after
 **at least 10x** on the recovery/extraction stage, with identical hit counts
 and offsets as v4 (correctness gate: the v4 selftest must still pass
 unchanged).
+
+### Results so far (256 MB fixture: 70% zero blocks, 30% data blocks, 25 hits)
+
+| Build | Elapsed | Throughput | Carved | Hits / offsets |
+|-------|---------|------------|--------|----------------|
+| v4 engine as-is (117 patterns) | 92.7 s | 2.8 MB/s | 75 files, 73.4 MB | 25 hits, digest `00dc8591592a37ce` |
+| + 13.3 zero-block skip | 80.5 s | 3.3 MB/s | 75 files | 25 hits, same digest |
+| + UTF-16-BE opt-out (81 patterns) and zero skip | **48.6 s** | **5.3 MB/s** | 75 files | 25 hits, same digest |
+| same, carving disabled (matching cost alone) | 29.6 s | 8.6 MB/s | - | 25 hits, same digest |
+
+Reading: **1.9x** end-to-end, **2.6x** on the matching stage, with byte-identical
+results. All of the remaining time is spent on the 30% of the image that holds
+real data - the zero blocks are now free. Next levers, in order of expected
+effect: two-phase carving (13.1: 19 s of the 48.6 s is carving inside the read
+loop), the trimmed profile (13.7), and parallel matching (13.5).
 
 ## Approved decisions
 
@@ -395,13 +425,22 @@ unchanged).
 |------|------|----------------|
 | 0 | `git mv`-style: copy `v4/*` into `v5/`, set `VERSION = "5.0"`, run the v4 selftest in `v5/` | establishes a correct base and a green test before any change |
 | 1 | Sections 11 + 12: the shared numbered picker (`pick_path()`) and `last_paths.json` | independent of the engine, immediately removes the typing pain in every flow |
-| 2 | Section 13.3 + 13.4 + 13.6: zero-block skip, no carving/log I/O in the read loop, mmap for images | biggest speed win per line of code, and it makes every later test faster |
-| 3 | Section 13.1: two-phase index-then-carve | changes the scan contract - do it before adding progressive/resume |
+| 2 | Section 13.3 zero-block skip + 13.7 UTF-16-BE opt-out, benchmarked against the v4 engine | measured 1.9x for a few lines of code; 13.2 was benchmarked and rejected here |
+| 3 | Section 13.1: two-phase index-then-carve (this is also what takes carving out of the read loop, 13.4) | changes the scan contract - do it before adding progressive/resume, and it is the next 19 s of the 48.6 s |
 | 4 | Sections 1, 2, 3, 4: provenance folder, organized output + index.html, resume, progressive 5% chunks | all of them sit on the phase-1 hit index from step 3 |
 | 5 | Sections 5, 9, 10: fast scan criteria, six-item main menu, pre-scan summary | menu restructure last so every mode already exists |
 | 6 | Sections 7, 8: JSON signature profile loading, SMB output | thin layers over the shared picker and the profile |
-| 7 | Section 13.2 + 13.5: anchor sieve and parallel matching, then the 13.8 benchmark | optimise only after behaviour is locked; benchmark proves it |
+| 7 | Section 13.5 parallel matching + 13.6 mmap for image files, then the final 13.8 benchmark (13.2 is closed as measured-and-rejected) | optimise only after behaviour is locked; the benchmark proves each step |
 | 8 | Section 12's same-disk refusal, selftest for v5, commit, tag `v5.0.0`, release with `python-embed.zip`, add v5 to CI | close the release exactly like v1..v4 |
+
+## Progress
+
+| Step | State | Evidence |
+|------|-------|----------|
+| 0 | **done** | `v5/` is `v4/` + `VERSION = "5.0"`; `v5/selftest.py` PASS, `v4/selftest.py` still PASS |
+| 1 | **done** | `pick_image` / `pick_folder` / `pick_destination` + `last_paths.json`; wired into the image source, the imaging destination and the recovered-data root; selftest covers discovery, depth limit, partial flag and remembered paths; driven interactively with scripted answers (menu, selection, partial confirmation, cancel) |
+| 2 | **done** | 256 MB fixture: 92.7 s -> 48.6 s (1.9x), identical hits and offsets; 13.2 measured and rejected (see 13.8) |
+| 3 | next | two-phase index-then-carve |
 
 ## Next step
 

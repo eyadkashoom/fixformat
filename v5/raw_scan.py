@@ -55,7 +55,12 @@ GB = 1024.0 ** 3
 VERSION = "5.0"
 
 # Every text signature is searched in all of these encodings.
-TEXT_ENCODINGS = ("utf-8", "utf-16-le", "utf-16-be")
+# Windows stores text as UTF-16-LE; UTF-16-BE is opt-in, because every BE
+# pattern starts with a 0x00 byte - the most common byte on a formatted disk -
+# and the benchmark showed those patterns dominating the match time.
+SEARCH_UTF16_BE = False
+TEXT_ENCODINGS = (("utf-8", "utf-16-le", "utf-16-be") if SEARCH_UTF16_BE
+                  else ("utf-8", "utf-16-le"))
 
 # Candidate file names carved out of recovered data (report section).
 NAME_RE = re.compile(
@@ -264,6 +269,24 @@ def read_window(f, start, end):
         f.seek(saved)
     s = start - a_start
     return data[s:min(s + (end - start), len(data))]
+
+
+_ZERO_BLOCKS = {}
+
+
+def zero_block(n):
+    """A cached all-zero bytes object of length n (C-level comparison target)."""
+    block = _ZERO_BLOCKS.get(n)
+    if block is None:
+        block = b"\x00" * n
+        _ZERO_BLOCKS[n] = block
+    return block
+
+
+# Measured and rejected (V5_PLAN.md 13.2): a single regex alternation over all
+# needles and an anchor-byte-class sieve both lost to plain bytes.find() per
+# pattern on zero-heavy blocks (5x and 4x slower). The winning strategy is the
+# per-pattern find loop in scan(), combined with the zero-block skip above.
 
 
 def get_device_size(f):
@@ -904,6 +927,7 @@ def scan(target, patterns, chunk_size, results_path, carve_dir=None,
     counts = dict((p[0], 0) for p in pat_list)
     carved_counts = {}
     scanned = 0
+    zero_bytes = 0
     interrupted = False
     started = time.time()
 
@@ -966,15 +990,30 @@ def scan(target, patterns, chunk_size, results_path, carve_dir=None,
                     break
 
                 combined = carry + chunk
-                combined_lower = combined.lower() if any_ci else None
                 base = next_off - len(carry)
                 carry_floor = len(carry)
 
+                # 13.3 zero-region fast skip: an all-zero block can only hold a
+                # signature that started inside the carried tail of the previous
+                # block, so the match runs over a tiny boundary window instead of
+                # the whole block. On a freshly formatted disk this is most of
+                # the volume, skipped at C-level memcmp speed.
+                if chunk == zero_block(len(chunk)):
+                    zero_bytes += len(chunk)
+                    hay = combined[:min(len(combined), carry_floor + max_len)]
+                else:
+                    hay = combined
+                hay_low = hay.lower() if any_ci else None
+
+                # 13.2 measured: one bytes.find() pass per pattern is the fastest
+                # strategy here (a single regex alternation of 117 needles was
+                # 4x slower, and an anchor-class sieve 5x slower on zero-heavy
+                # blocks - see V5_PLAN.md 13.8).
                 for label, pat, ext, ci, pat_low in pat_list:
                     needle = pat_low if ci else pat
-                    hay = combined_lower if ci else combined
+                    hay_use = hay_low if ci else hay
                     plen = len(pat)
-                    pos = hay.find(needle)
+                    pos = hay_use.find(needle)
                     while pos != -1:
                         if pos + plen > carry_floor and _reportable(last_hit, label, base + pos, min_gap):
                             abs_off = base + pos
@@ -998,7 +1037,7 @@ def scan(target, patterns, chunk_size, results_path, carve_dir=None,
                                     % (now(), label, abs_off, abs_off, sector, carved_path or "-"))
                             log(line)
                             print("\n" + line)
-                        pos = hay.find(needle, pos + 1)
+                        pos = hay_use.find(needle, pos + 1)
 
                 scanned += len(chunk)
                 next_off += len(chunk)
@@ -1018,6 +1057,8 @@ def scan(target, patterns, chunk_size, results_path, carve_dir=None,
         log("=== SCAN END %s === status=%s" % (now(), "INTERRUPTED" if interrupted else "COMPLETE"))
         log("bytes scanned: %d" % scanned)
         log("sectors      : %d" % (scanned // SECTOR_SIZE))
+        if scanned:
+            log("zero regions : %d bytes (%.1f%%)" % (zero_bytes, 100.0 * zero_bytes / scanned))
         log("elapsed      : %s" % fmt_hms(elapsed))
         log("hits total   : %d" % len(hits))
         for entry in pat_list:
@@ -1027,6 +1068,7 @@ def scan(target, patterns, chunk_size, results_path, carve_dir=None,
             "target": target,
             "total_size": total_size,
             "bytes_scanned": scanned,
+            "zero_bytes": zero_bytes,
             "elapsed": elapsed,
             "hits": hits,
             "counts": counts,
