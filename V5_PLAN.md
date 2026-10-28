@@ -305,12 +305,19 @@ code actually does.
 
 ### Plan
 
-**13.1 Two-phase recovery (index, then carve)** - the biggest single win.
-Phase 1 records only `(offset, label)` and never touches the disk again;
-phase 2 sorts those offsets and walks the source **forward once** in large
-blocks, serving every window from the block in memory. Thousands of random
-back-seeks become one sequential pass. It also lets the user review the hit
-index before committing disk space to extracted files.
+**13.1 Two-phase recovery (index, then carve)** - implemented.
+Phase 1 records only `(offset, label, ext, plen)` and never touches the source
+again; phase 2 sorts those offsets and walks the source **forward once** in
+4 MB blocks (`CachedReader`), serving every window from the block in memory.
+Thousands of random back-seeks become one sequential pass. It also lets the
+user review the hit index before committing disk space to extracted files.
+
+Measured on the RAM-cached fixture: **no gain by itself** (43.2 s with it vs
+40.5 s without - inside the noise), because a page-cached file makes a back-seek
+as cheap as a forward read. It is kept for three reasons: it removes the seeks
+that cost real time on a physical disk, it is the prerequisite for progressive
+scanning and resume (Sections 3 and 4), and it made the triage fix below
+possible by separating matching from writing.
 
 **13.2 One C-level pass per block - MEASURED AND REJECTED**
 Three candidate matchers were built and benchmarked on one 8 MB block of the
@@ -335,16 +342,38 @@ skip matching entirely, count it, and report zero runs as SSD-TRIM / wiped
 evidence (this is the detection approved in Section 5, implemented once and
 reused by every mode).
 
-**13.4 Never carve inside the read path**
-Queue the hits and let a writer drain them; buffer log lines and flush once a
-second (or every 200 lines) instead of per hit. Add `--quiet`, which prints a
-single live counter line. Console output must never be in the read loop.
+**13.4 Never carve inside the read path** - implemented.
+Phase 2 queues the work instead of doing it mid-read, log lines are buffered and
+flushed once per block, and a hit line no longer prints with console I/O inside
+the read loop. Carving a text window used to cost ~256 tiny seek+read calls per
+hit; through `CachedReader` they are memory slices.
 
-**13.5 Parallel matching**
-One thread reads blocks sequentially into a bounded queue; K worker
-**processes** do the matching (bytes `find`/`re` hold the GIL, so threads do
-not help), and results are merged in offset order. ~3-4x on a 4-core machine,
-with the disk still read strictly sequentially.
+**13.4b Triage in C instead of a Python loop** - implemented, measured 1.2x.
+`printable_ratio()` walked a 1 MB window byte by byte in Python (~70 ms per
+carved file) and `is_all_zeros()` allocated a 1 MB zero buffer per call. Both
+are now single C-level operations (`bytes.translate(None, table)` and
+`bytes.count`). Triage cost fell from 11.2 s to 2.9 s on the fixture, with an
+identical classification for every window (20 random buffers checked).
+
+**13.5 Parallel matching** - implemented, measured 2.0x on top of everything else.
+Phase 1 splits the source into N byte ranges and scans them in **processes**
+(bytes `find` holds the GIL). Each worker opens its own handle, skips zero
+blocks the same way, and reports only hits that START inside its own range;
+the parent merges, applies MIN_GAP over the offset-ordered list (exactly what
+one sequential pass did) and hands the result to phase 2. Workers run through
+`multiprocessing` with the `spawn` context, and any pool failure falls back to
+a single process instead of losing the scan.
+
+The bug the equality test caught (worth keeping in mind for any future ranged
+scan): a worker that stops reading exactly at its `end` **loses every pattern
+that straddles the boundary**, because only the *next* block exposes it through
+the carry. Workers now read `end + max_pattern_len` bytes and still report only
+inside `[start, end)`. The selftest asserts parallel hits == sequential hits on
+a fixture whose hits sit across the range boundaries.
+
+`PARALLEL_WORKERS = None` means auto (up to 4); `1` forces one process (set it
+for a slow spinning disk if 4 streams measure slower). `PARALLEL_MIN_SIZE`
+keeps small sources sequential.
 
 **13.6 Image-specific path** (the exact complaint)
 - `mmap` the image instead of `read()`: no copy, and the OS page cache keeps
@@ -387,14 +416,20 @@ unchanged).
 |-------|---------|------------|--------|----------------|
 | v4 engine as-is (117 patterns) | 92.7 s | 2.8 MB/s | 75 files, 73.4 MB | 25 hits, digest `00dc8591592a37ce` |
 | + 13.3 zero-block skip | 80.5 s | 3.3 MB/s | 75 files | 25 hits, same digest |
-| + UTF-16-BE opt-out (81 patterns) and zero skip | **48.6 s** | **5.3 MB/s** | 75 files | 25 hits, same digest |
-| same, carving disabled (matching cost alone) | 29.6 s | 8.6 MB/s | - | 25 hits, same digest |
+| + UTF-16-BE opt-out (81 patterns) | 48.6 s | 5.3 MB/s | 75 files | 25 hits, same digest |
+| + 13.4b triage in C | 40.5 s | 6.3 MB/s | 75 files | 25 hits, same digest |
+| + 13.1/13.4 two-phase carve, one process | 43.2 s | 5.9 MB/s | 75 files | 25 hits, same digest |
+| **+ 13.5 parallel phase 1 (auto = 4)** | **21.6 s** | **11.9 MB/s** | 75 files | 25 hits, same digest |
 
-Reading: **1.9x** end-to-end, **2.6x** on the matching stage, with byte-identical
-results. All of the remaining time is spent on the 30% of the image that holds
-real data - the zero blocks are now free. Next levers, in order of expected
-effect: two-phase carving (13.1: 19 s of the 48.6 s is carving inside the read
-loop), the trimmed profile (13.7), and parallel matching (13.5).
+**4.3x end to end, 7.4x in matching, with byte-identical output** (same 25 hits,
+same offsets, same 75 carved files, same SHA-256 over the hit list). Cost split
+measured with each stage disabled: matching 28.9 s, smart-text extension and
+writes 19.6 s, triage 11.2 s (before 13.4b).
+
+What is left on the table: the carved bytes are ~73 MB for 25 hits because
+smart-text extension writes up to 1 MB per text hit - worth revisiting once the
+output folders (Sections 1 and 2) decide what actually needs to be kept on disk,
+and mmap (13.6) only pays on repeated scans of the same image.
 
 ## Approved decisions
 
@@ -430,7 +465,7 @@ loop), the trimmed profile (13.7), and parallel matching (13.5).
 | 4 | Sections 1, 2, 3, 4: provenance folder, organized output + index.html, resume, progressive 5% chunks | all of them sit on the phase-1 hit index from step 3 |
 | 5 | Sections 5, 9, 10: fast scan criteria, six-item main menu, pre-scan summary | menu restructure last so every mode already exists |
 | 6 | Sections 7, 8: JSON signature profile loading, SMB output | thin layers over the shared picker and the profile |
-| 7 | Section 13.5 parallel matching + 13.6 mmap for image files, then the final 13.8 benchmark (13.2 is closed as measured-and-rejected) | optimise only after behaviour is locked; the benchmark proves each step |
+| 7 | Section 13.6 mmap for image files and the 13.8 benchmark on real media | **13.5 is done early** (it was the only way to reach the 3x target); mmap only pays on repeated scans |
 | 8 | Section 12's same-disk refusal, selftest for v5, commit, tag `v5.0.0`, release with `python-embed.zip`, add v5 to CI | close the release exactly like v1..v4 |
 
 ## Progress
@@ -440,7 +475,8 @@ loop), the trimmed profile (13.7), and parallel matching (13.5).
 | 0 | **done** | `v5/` is `v4/` + `VERSION = "5.0"`; `v5/selftest.py` PASS, `v4/selftest.py` still PASS |
 | 1 | **done** | `pick_image` / `pick_folder` / `pick_destination` + `last_paths.json`; wired into the image source, the imaging destination and the recovered-data root; selftest covers discovery, depth limit, partial flag and remembered paths; driven interactively with scripted answers (menu, selection, partial confirmation, cancel) |
 | 2 | **done** | 256 MB fixture: 92.7 s -> 48.6 s (1.9x), identical hits and offsets; 13.2 measured and rejected (see 13.8) |
-| 3 | next | two-phase index-then-carve |
+| 3 | **done** (plus 13.4b and 13.5 pulled forward) | two-phase carve (`CachedReader` + `carve_phase`), triage moved to C, parallel phase 1 with a sequential fallback. 92.7 s -> 21.6 s (**4.3x**), same digest, same 75 carved files. Selftest now asserts parallel hits == sequential hits |
+| 4 | next | Sections 1, 2, 3, 4 on top of the phase-1 hit index |
 
 ## Next step
 

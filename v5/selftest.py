@@ -236,6 +236,33 @@ def main():
     finally:
         raw_scan.LAST_PATHS_FILE = saved_last_paths
 
+    # v5: parallel phase 1 must return exactly the hits of one sequential pass
+    saved_workers = raw_scan.PARALLEL_WORKERS
+    saved_min_size = raw_scan.PARALLEL_MIN_SIZE
+    raw_scan.PARALLEL_WORKERS = 2
+    raw_scan.PARALLEL_MIN_SIZE = 0
+    try:
+        par_results = os.path.join(tmpdir, "search_results_parallel.txt")
+        par_summary = raw_scan.scan(img, patterns, CHUNK, par_results, None,
+                                    carve_before=64, carve_after=64,
+                                    show_progress=False, min_gap=MIN_GAP)
+        par_hits = sorted((r["label"], r["offset"]) for r in par_summary["hits"])
+        seq_hits = sorted((r["label"], r["offset"]) for r in summary["hits"])
+        if par_hits != seq_hits:
+            failures.append("parallel phase 1 changed the hits:\n  seq %s\n  par %s"
+                            % (seq_hits, par_hits))
+        if par_summary["bytes_scanned"] != summary["bytes_scanned"]:
+            failures.append("parallel bytes_scanned = %d, expected %d"
+                            % (par_summary["bytes_scanned"], summary["bytes_scanned"]))
+        if par_summary["counts"] != summary["counts"]:
+            failures.append("parallel counts differ: %s vs %s"
+                            % (par_summary["counts"], summary["counts"]))
+    except Exception as exc:
+        failures.append("parallel phase 1 raised: %s" % exc)
+    finally:
+        raw_scan.PARALLEL_WORKERS = saved_workers
+        raw_scan.PARALLEL_MIN_SIZE = saved_min_size
+
     # results log must contain every reported hit
     with open(results, "r", encoding="utf-8") as fh:
         log_text = fh.read()

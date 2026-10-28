@@ -753,6 +753,12 @@ def _reportable(last_hit, label, abs_off, min_gap):
 
 
 
+# Bytes that are NOT printable text: deleted in one C-level translate() call to
+# count printable bytes without a Python loop (see printable_ratio).
+_NON_PRINTABLE_BYTES = bytes(b for b in range(256)
+                             if not ((32 <= b < 127) or b in (9, 10, 13)))
+
+
 def shannon_entropy(data):
     """Shannon entropy in bits/byte for `data` (0..8)."""
     if not data:
@@ -773,8 +779,8 @@ def printable_ratio(data):
     """Fraction of bytes that are printable ASCII or common whitespace."""
     if not data:
         return 0.0
-    printable = sum(1 for b in data if (32 <= b < 127) or b in (9, 10, 13))
-    return printable / len(data)
+    # C-level count: a Python loop over a 1 MB window cost ~70 ms per file.
+    return len(data.translate(None, _NON_PRINTABLE_BYTES)) / len(data)
 
 
 def classify_window(data):
@@ -897,6 +903,245 @@ def carve_window(f, abs_off, plen, total_size, carve_dir, label, ext, before, af
         return "(carve failed: %s)" % exc
 
 
+class CachedReader(object):
+    """
+    A file-like view that serves read()/seek()/tell() from one forward block.
+
+    carve_window() and smart_extend_text() ask for a few kilobytes at a time;
+    without a cache each of those small reads is a seek plus a syscall (one hit
+    of a text window cost ~256 of them). In phase 2 the hits arrive sorted by
+    offset, so almost every request is served from the block already in memory.
+    """
+
+    def __init__(self, f, block_size=None):
+        self._f = f
+        self._block = block_size or CARVE_BLOCK_SIZE
+        self._start = 0
+        self._data = b""
+        self._pos = 0
+
+    def tell(self):
+        return self._pos
+
+    def seek(self, offset, whence=0):
+        if whence == 0:
+            self._pos = int(offset)
+        elif whence == 1:
+            self._pos += int(offset)
+        else:
+            raise ValueError("CachedReader does not support seek from the end")
+        return self._pos
+
+    def _read_range(self, start, end):
+        if end <= start:
+            return b""
+        cached = self._data
+        if cached and self._start <= start and end <= self._start + len(cached):
+            offset = start - self._start
+            return cached[offset:offset + (end - start)]
+        aligned = (start // self._block) * self._block
+        length = max(self._block, end - aligned)
+        self._f.seek(aligned)
+        self._data = read_exact(self._f, length)
+        self._start = aligned
+        offset = start - aligned
+        return self._data[offset:offset + (end - start)]
+
+    def read(self, size):
+        if size is None or size < 0:
+            raise ValueError("CachedReader needs an explicit read size")
+        data = self._read_range(self._pos, self._pos + size)
+        self._pos += len(data)
+        return data
+
+
+def carve_phase(f, hits, total_size, carve_dir, before, after, carve_limit,
+                carved_counts, log, show_progress=True):
+    """
+    Phase 2 of the two-phase recovery (V5_PLAN.md 13.1).
+
+    The hits were recorded by phase 1 without touching the source again. Here
+    they are sorted by offset and their windows are carved through one
+    forward-moving cache, so a thousand windows cost one sequential read per
+    CARVE_BLOCK_SIZE instead of a back-seek each. Fills hit["carved"] and
+    returns the number of files written.
+    """
+    if not hits:
+        return 0
+    reader = CachedReader(f)
+    ordered = sorted(hits, key=lambda h: h["offset"])
+    total = len(ordered)
+    carved = 0
+    last = [0.0]
+    for done, hit in enumerate(ordered, 1):
+        label = hit["label"]
+        if carve_limit and carved_counts.get(label, 0) >= carve_limit:
+            hit["carved"] = "(carve limit reached)"
+            continue
+        path = carve_window(reader, hit["offset"], hit.get("plen", 1), total_size,
+                            carve_dir, label, hit.get("ext", ""), before, after,
+                            smart_text=ENABLE_SMART_TEXT, triage=ENABLE_TRIAGE)
+        hit["carved"] = path
+        if path and not path.startswith("(carve failed"):
+            carved_counts[label] = carved_counts.get(label, 0) + 1
+            carved += 1
+            log("CARVED | %s | offset=0x%016X | %s" % (label, hit["offset"], path))
+        elif path:
+            log("CARVE PROBLEM | %s | offset=0x%016X | %s"
+                % (label, hit["offset"], path))
+        if show_progress:
+            t = time.time()
+            if t - last[0] >= 0.5 or done == total:
+                last[0] = t
+                sys.stdout.write("\rCarving %d / %d hits (%d files)   "
+                                 % (done, total, carved))
+                sys.stdout.flush()
+    if show_progress:
+        print()
+    return carved
+
+
+def build_pat_list(patterns):
+    """[(label, pattern, ext, case_insensitive, matched_bytes), ...]"""
+    out = []
+    for entry in patterns:
+        label, pat, ext = entry[0], entry[1], entry[2]
+        ci = entry[3] if len(entry) > 3 else False
+        out.append((label, pat, ext, ci, pat.lower() if ci else pat))
+    return out
+
+
+def match_block(hay, hay_low, pat_list, base, carry_floor, last_hit, min_gap):
+    """
+    Every reportable hit inside one block, as (label, ext, plen, abs_offset).
+
+    One bytes.find() pass per pattern is deliberate and measured: it beat a
+    single regex alternation and an anchor-byte sieve by 4-5x (see
+    V5_PLAN.md 13.2). Shared by the sequential and the parallel phase 1 so the
+    two paths can never drift.
+    """
+    out = []
+    for label, pat, ext, ci, pat_low in pat_list:
+        needle = pat_low if ci else pat
+        hay_use = hay_low if ci else hay
+        plen = len(pat)
+        pos = hay_use.find(needle)
+        while pos != -1:
+            if pos + plen > carry_floor and _reportable(last_hit, label, base + pos, min_gap):
+                out.append((label, ext, plen, base + pos))
+            pos = hay_use.find(needle, pos + 1)
+    return out
+
+
+def parallel_worker_count():
+    """How many phase-1 processes to use (1 = sequential)."""
+    if PARALLEL_WORKERS is None:
+        try:
+            return max(1, min(4, os.cpu_count() or 1))
+        except Exception:
+            return 1
+    try:
+        return max(1, int(PARALLEL_WORKERS))
+    except (TypeError, ValueError):
+        return 1
+
+
+def _scan_range_worker(job):
+    """
+    Phase 1 for one byte range, executed in a child process.
+
+    Each worker opens its own handle, reads forward, and reports only the hits
+    that START inside its own [start, end) so adjacent ranges never report the
+    same hit twice. MIN_GAP is NOT applied here - the parent applies it over the
+    merged, offset-ordered hits, which is exactly what one sequential pass did.
+    """
+    target, patterns, start, end, chunk_size = job
+    pat_list = build_pat_list(patterns)
+    max_len = max(len(p[1]) for p in pat_list)
+    carry_len = max_len - 1
+    any_ci = any(p[3] for p in pat_list)
+
+    hits = []
+    local_hit = {}
+    read_from = max(0, start - carry_len)
+    aligned = (read_from // DEVICE_ALIGNMENT) * DEVICE_ALIGNMENT
+    # Read a little PAST `end`: a pattern can start just before the range
+    # boundary and finish after it, and only the next block's carry exposes it.
+    read_limit = end + max_len
+
+    f = open(target, "rb", buffering=0)
+    try:
+        f.seek(aligned)
+        carry = b""
+        next_off = aligned
+        while next_off < read_limit:
+            chunk = read_exact(f, chunk_size)
+            if not chunk:
+                break
+            combined = carry + chunk
+            base = next_off - len(carry)
+            carry_floor = len(carry)
+            if chunk == zero_block(len(chunk)):
+                hay = combined[:min(len(combined), carry_floor + max_len)]
+            else:
+                hay = combined
+            hay_low = hay.lower() if any_ci else None
+            for label, ext, plen, abs_off in match_block(hay, hay_low, pat_list,
+                                                         base, carry_floor,
+                                                         local_hit, 0):
+                if start <= abs_off < end:
+                    hits.append({"label": label, "offset": abs_off,
+                                 "sector": abs_off // SECTOR_SIZE,
+                                 "carved": "", "ext": ext, "plen": plen})
+            next_off += len(chunk)
+            if len(chunk) < chunk_size:
+                break
+            carry = combined[-carry_len:] if carry_len else b""
+    finally:
+        f.close()
+    return hits
+
+
+def parallel_phase1(target, patterns, total_size, chunk_size, workers, min_gap,
+                    show_progress=True):
+    """
+    Split the source into `workers` byte ranges and scan them in parallel
+    processes (bytes.find holds the GIL, so threads would not help). Returns the
+    merged hits with MIN_GAP applied in local order, which is what one
+    sequential pass produced.
+    """
+    import multiprocessing
+
+    step = max(chunk_size, ((total_size + workers - 1) // workers // chunk_size) * chunk_size)
+    jobs = []
+    start = 0
+    while start < total_size:
+        end = min(total_size, start + step)
+        jobs.append((target, patterns, start, end, chunk_size))
+        start = end
+
+    parts = []
+    ctx = multiprocessing.get_context("spawn")
+    with ctx.Pool(processes=min(workers, len(jobs))) as pool:
+        for done, part in enumerate(pool.imap_unordered(_scan_range_worker, jobs), 1):
+            parts.extend(part)
+            if show_progress:
+                sys.stdout.write("\rParallel phase 1: %d / %d ranges done, %d hits   "
+                                 % (done, len(jobs), len(parts)))
+                sys.stdout.flush()
+    if show_progress:
+        print()
+
+    merged = sorted(parts, key=lambda h: h["offset"])
+    last_hit = {}
+    kept = []
+    for hit in merged:
+        if _reportable(last_hit, hit["label"], hit["offset"], min_gap):
+            kept.append(hit)
+    kept.sort(key=lambda h: (h["label"], h["offset"]))
+    return kept
+
+
 def scan(target, patterns, chunk_size, results_path, carve_dir=None,
          carve_before=4096, carve_after=65536, show_progress=True,
          min_gap=0, carve_limit=0):
@@ -913,11 +1158,7 @@ def scan(target, patterns, chunk_size, results_path, carve_dir=None,
     if is_device and chunk_size % DEVICE_ALIGNMENT != 0:
         raise ValueError("For raw devices chunk_size must be a multiple of %d" % DEVICE_ALIGNMENT)
 
-    pat_list = []
-    for entry in patterns:
-        label, pat, ext = entry[0], entry[1], entry[2]
-        ci = entry[3] if len(entry) > 3 else False
-        pat_list.append((label, pat, ext, ci, pat.lower() if ci else pat))
+    pat_list = build_pat_list(patterns)
 
     max_len = max(len(p[1]) for p in pat_list)
     carry_len = max_len - 1
@@ -928,6 +1169,7 @@ def scan(target, patterns, chunk_size, results_path, carve_dir=None,
     carved_counts = {}
     scanned = 0
     zero_bytes = 0
+    use_parallel = False
     interrupted = False
     started = time.time()
 
@@ -958,6 +1200,7 @@ def scan(target, patterns, chunk_size, results_path, carve_dir=None,
         next_off = 0
         last_hit = {}
         last_progress = [0.0]
+        pending = []
 
         def update_progress(force=False):
             if not show_progress:
@@ -983,8 +1226,40 @@ def scan(target, patterns, chunk_size, results_path, carve_dir=None,
             sys.stdout.write(line)
             sys.stdout.flush()
 
+        # ---- phase 1: parallel byte ranges when the source is big enough ----
+        workers = parallel_worker_count()
+        if workers > 1 and total_size and total_size >= PARALLEL_MIN_SIZE:
+            try:
+                print("Scanning %s in %d parallel ranges ..." % (fmt_bytes(total_size), workers))
+                found = parallel_phase1(target, patterns, total_size, chunk_size,
+                                        workers, min_gap, show_progress)
+                hits.extend(found)
+                counts = dict((p[0], 0) for p in pat_list)
+                for hit in hits:
+                    counts[hit["label"]] = counts.get(hit["label"], 0) + 1
+                    line = ("[%s] HIT | %s | offset=0x%016X (dec %d) | sector=%d"
+                            % (now(), hit["label"], hit["offset"], hit["offset"],
+                               hit["sector"]))
+                    log(line)
+                    pending.append(line)
+                if pending:
+                    print()
+                    print("\n".join(pending))
+                    del pending[:]
+                scanned = total_size
+                use_parallel = True
+            except Exception as exc:      # a broken pool must never lose the scan
+                log("parallel phase failed: %s - falling back to one process" % exc)
+                print("Parallel scan failed (%s) - falling back to one process." % exc)
+                del hits[:]
+                use_parallel = False
+        log("mode         : %s" % ("parallel phase 1 (%d processes)" % workers
+                                   if use_parallel else "single process"))
+        if not use_parallel and workers > 1 and total_size and total_size < PARALLEL_MIN_SIZE:
+            log("parallel     : off (source smaller than %s)" % fmt_bytes(PARALLEL_MIN_SIZE))
+
         try:
-            while True:
+            while not use_parallel:
                 chunk = read_exact(f, chunk_size)
                 if not chunk:
                     break
@@ -1009,35 +1284,24 @@ def scan(target, patterns, chunk_size, results_path, carve_dir=None,
                 # strategy here (a single regex alternation of 117 needles was
                 # 4x slower, and an anchor-class sieve 5x slower on zero-heavy
                 # blocks - see V5_PLAN.md 13.8).
-                for label, pat, ext, ci, pat_low in pat_list:
-                    needle = pat_low if ci else pat
-                    hay_use = hay_low if ci else hay
-                    plen = len(pat)
-                    pos = hay_use.find(needle)
-                    while pos != -1:
-                        if pos + plen > carry_floor and _reportable(last_hit, label, base + pos, min_gap):
-                            abs_off = base + pos
-                            sector = abs_off // SECTOR_SIZE
-                            carved_path = ""
-                            carved_ok = (carve_dir and
-                                         (not carve_limit or carved_counts.get(label, 0) < carve_limit))
-                            if carved_ok:
-                                carved_path = carve_window(
-                                    f, abs_off, plen, total_size, carve_dir,
-                                    label, ext, carve_before, carve_after,
-                                    smart_text=ENABLE_SMART_TEXT, triage=ENABLE_TRIAGE)
-                                if carved_path and not carved_path.startswith("(carve failed"):
-                                    carved_counts[label] = carved_counts.get(label, 0) + 1
-                            elif carve_dir:
-                                carved_path = "(carve limit reached)"
-                            hits.append({"label": label, "offset": abs_off,
-                                         "sector": sector, "carved": carved_path})
-                            counts[label] += 1
-                            line = ("[%s] HIT | %s | offset=0x%016X (dec %d) | sector=%d | carved=%s"
-                                    % (now(), label, abs_off, abs_off, sector, carved_path or "-"))
-                            log(line)
-                            print("\n" + line)
-                        pos = hay_use.find(needle, pos + 1)
+                for label, ext, plen, abs_off in match_block(hay, hay_low, pat_list,
+                                                             base, carry_floor,
+                                                             last_hit, min_gap):
+                    sector = abs_off // SECTOR_SIZE
+                    hits.append({"label": label, "offset": abs_off,
+                                 "sector": sector, "carved": "",
+                                 "ext": ext, "plen": plen})
+                    counts[label] += 1
+                    line = ("[%s] HIT | %s | offset=0x%016X (dec %d) | sector=%d"
+                            % (now(), label, abs_off, abs_off, sector))
+                    log(line)
+                    pending.append(line)
+
+                if pending:
+                    print()
+                    print("\n".join(pending))
+                    del pending[:]
+                log_file.flush()
 
                 scanned += len(chunk)
                 next_off += len(chunk)
@@ -1052,6 +1316,16 @@ def scan(target, patterns, chunk_size, results_path, carve_dir=None,
         update_progress(force=True)
         if show_progress:
             print()
+
+        # ---- phase 2: carve every recorded hit in ONE forward pass ----------
+        carved_files = 0
+        if carve_dir and hits:
+            print("-" * 78)
+            print("PHASE 2 - CARVING %d HITS (one forward read of the source)" % len(hits))
+            print("-" * 78)
+            carved_files = carve_phase(f, hits, total_size, carve_dir,
+                                       carve_before, carve_after, carve_limit,
+                                       carved_counts, log, show_progress)
 
         elapsed = time.time() - started
         log("=== SCAN END %s === status=%s" % (now(), "INTERRUPTED" if interrupted else "COMPLETE"))
@@ -1072,6 +1346,7 @@ def scan(target, patterns, chunk_size, results_path, carve_dir=None,
             "elapsed": elapsed,
             "hits": hits,
             "counts": counts,
+            "carved_files": carved_files,
             "interrupted": interrupted,
             "results_path": results_path,
             "carve_dir": carve_dir,
@@ -1525,10 +1800,10 @@ def set_sparse_file(f):
 
 
 def is_all_zeros(chunk):
-    """True when chunk consists entirely of zero bytes."""
+    """True when chunk consists entirely of zero bytes (no buffer allocated)."""
     if not chunk:
         return True
-    return chunk == b"\x00" * len(chunk)
+    return chunk.count(b"\x00") == len(chunk)
 
 
 def ask_imaging_mode():
@@ -2003,6 +2278,14 @@ CARVE_DIR = "recovered"
 CARVE_BEFORE = 4096            # bytes kept before the hit
 CARVE_AFTER = 64 * 1024        # bytes kept after the hit
 CARVE_LIMIT = 100              # max carved files per pattern (0 = unlimited)
+# Phase 2 reads the source forward in blocks of this size and serves every carve
+# window from the block in memory (one read per 4 MB instead of a seek per hit).
+CARVE_BLOCK_SIZE = 4 * 1024 * 1024
+# Phase 1 scans independent byte ranges in separate processes: bytes.find holds
+# the GIL, so threads would not help. None = auto (up to 4 processes),
+# 1 = always sequential. Small sources stay sequential.
+PARALLEL_WORKERS = None
+PARALLEL_MIN_SIZE = 64 * 1024 * 1024
 
 # Magic-byte signatures: label -> hex bytes (or bytes). Binary formats with a
 # fixed, well-known header. Add more whenever you need them.
