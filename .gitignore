@@ -8,6 +8,7 @@ recovered/
 search_results.txt
 recovery_report.txt
 *.img
+last_paths.json
 
 # Python
 __pycache__/
