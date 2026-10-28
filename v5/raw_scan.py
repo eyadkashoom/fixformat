@@ -1543,28 +1543,273 @@ def print_report(summary, names):
 
 
 def ask_save_location(work_dir):
-    """Numbered picker for where the recovered data is kept. Returns the final dir."""
+    """
+    Ask whether the two run folders should be moved to another disk.
+    Returns the chosen root folder, or "" to keep them where they are.
+    """
     print()
-    print("Where should the recovered data be saved permanently?")
+    print("Keep the results here, or move them to another disk?")
     print("Choose a folder on a DIFFERENT disk than the scanned one - writing")
     print("onto the damaged disk can overwrite the very data you want to recover.")
     print()
-    answer, ok = _ask("Choose a destination folder now? [y/N]: ")
+    answer, ok = _ask("Move the results to another folder now? [y/N]: ")
     if not ok or answer.strip().lower() not in ("y", "yes"):
-        print("Recovered data kept in: %s" % work_dir)
-        return work_dir
+        print("Results kept in: %s" % work_dir)
+        return ""
     root = pick_folder("the recovered data")
     if not root:
-        print("Recovered data kept in: %s" % work_dir)
-        return work_dir
+        print("Results kept in: %s" % work_dir)
+        return ""
+    if os.path.abspath(root) == os.path.abspath(work_dir):
+        print("Results kept in: %s" % work_dir)
+        return ""
+    remember_path("recovered", root)
+    return root
+
+
+# ----------------------------------------------------------------------
+# run folders: provenance (V5 Section 1) and organized output (Section 2)
+# ----------------------------------------------------------------------
+
+RECOVERED_PREFIX = "recovered_"
+ORGANIZED_PREFIX = "organized_"
+PROVENANCE_FILE = "provenance.json"
+
+
+def source_label(target):
+    """'PhysicalDrive0' for a device, else the image base name (sanitized)."""
+    if target.startswith("\\\\"):
+        tail = target.replace("\\\\", "\\").split("\\")[-1]
+        clean = "".join(ch if ch.isalnum() else "_" for ch in tail).strip("_")
+        return clean or "device"
+    base = os.path.basename(target.rstrip("\\/")) or "image"
+    for suffix in (".img.gz", ".img.xz", ".img.zst", ".img", ".raw", ".dd"):
+        if base.lower().endswith(suffix):
+            base = base[:-len(suffix)]
+            break
+    clean = "".join(ch if (ch.isalnum() or ch in "-_") else "_" for ch in base)
+    return clean[:40] or "image"
+
+
+def size_tag(total):
+    """Folder-safe size tag: '476.9GB', '114.6GB', '900MB', 'unknown'."""
+    if not total:
+        return "unknown"
+    for unit, div in (("TB", 1024.0 ** 4), ("GB", 1024.0 ** 3),
+                      ("MB", 1024.0 ** 2), ("KB", 1024.0)):
+        if total >= div:
+            return "%.1f%s" % (total / div, unit)
+    return "%dB" % total
+
+
+def run_tag(target, total):
+    """<label>_<size>_<timestamp> - the provenance stamp shared by both folders."""
+    return "%s_%s_%s" % (source_label(target), size_tag(total),
+                         datetime.now().strftime("%Y%m%d_%H%M%S"))
+
+
+def make_run_dirs(base_dir, target, total, tag=None):
+    """
+    Create recovered_<tag>/carved and organized_<tag>/by_extension under
+    base_dir. Returns (recovered_dir, organized_dir, tag).
+    """
+    tag = tag or run_tag(target, total)
+    recovered = os.path.join(base_dir, RECOVERED_PREFIX + tag)
+    organized = os.path.join(base_dir, ORGANIZED_PREFIX + tag)
+    os.makedirs(os.path.join(recovered, "carved"), exist_ok=True)
+    os.makedirs(os.path.join(organized, "by_extension"), exist_ok=True)
+    return recovered, organized, tag
+
+
+def write_provenance(run_dir, data):
+    """Write provenance.json into the recovered folder. Returns the path or ''."""
+    path = os.path.join(run_dir, PROVENANCE_FILE)
     try:
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        dest = os.path.join(root, "recovered_" + stamp)
-        os.makedirs(dest, exist_ok=True)
-        return dest
-    except OSError as exc:
-        print("Cannot use %s: %s - keeping the data in: %s" % (root, exc, work_dir))
-        return work_dir
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2, ensure_ascii=False)
+        return path
+    except OSError:
+        return ""
+
+
+def read_provenance(run_dir):
+    """The provenance dict of a recovered folder, {} when unreadable."""
+    try:
+        with open(os.path.join(run_dir, PROVENANCE_FILE), "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def find_recoveries(roots=None, depth=1):
+    """[(folder, provenance), ...] for every recovered_* folder that has one."""
+    if roots is None:
+        roots = [SCRIPT_DIR, os.getcwd()]
+        remembered = load_last_paths().get("recovered")
+        if remembered:
+            roots.append(remembered)
+        roots.extend(root for root, _t, _f in list_logical_drives())
+    found = []
+    seen = set()
+    for root in roots:
+        if not root or not os.path.isdir(root):
+            continue
+        root = os.path.abspath(root)
+        base_depth = root.rstrip("\\/").count(os.sep)
+        for cur, dirs, _files in os.walk(root, onerror=lambda _e: None):
+            if cur.rstrip("\\/").count(os.sep) - base_depth >= depth:
+                dirs[:] = []
+            dirs[:] = [d for d in dirs if d.startswith(RECOVERED_PREFIX)]
+            for name in list(dirs):
+                path = os.path.join(cur, name)
+                key = path.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                prov = read_provenance(path)
+                if prov:
+                    found.append((path, prov))
+    found.sort(key=lambda item: str(item[1].get("started", "")), reverse=True)
+    return found
+
+
+def provenance_payload(target, total, summary, patterns, case_sensitive,
+                       started_at, progress=None):
+    """The provenance.json body for one run (Section 1)."""
+    payload = {
+        "tool": "fixformat raw_scan.py",
+        "version": VERSION,
+        "started": started_at,
+        "updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "source": target,
+        "source_label": source_label(target),
+        "source_size": total,
+        "source_size_text": fmt_bytes(total) if total else "unknown",
+        "signatures": len(patterns),
+        "signature_labels": [p[0] for p in patterns],
+        "case_sensitive": bool(case_sensitive),
+        "min_gap": MIN_GAP,
+        "carve_before": CARVE_BEFORE,
+        "carve_after": CARVE_AFTER,
+        "chunk_size": CHUNK_SIZE,
+    }
+    if summary:
+        payload.update({
+            "bytes_scanned": summary.get("bytes_scanned", 0),
+            "zero_bytes": summary.get("zero_bytes", 0),
+            "hits": len(summary.get("hits") or []),
+            "carved_files": summary.get("carved_files", 0),
+            "counts": summary.get("counts", {}),
+            "interrupted": bool(summary.get("interrupted")),
+            "elapsed_seconds": round(summary.get("elapsed", 0.0), 1),
+            "status": "interrupted" if summary.get("interrupted") else "complete",
+        })
+    if progress:
+        payload.update(progress)
+    return payload
+
+
+def organize_output(summary, run_dir, organized_dir, names=None):
+    """
+    Section 2: move every carved file into organized/by_extension/<ext>/,
+    then write index.html (relative links) and summary.txt. Returns
+    (moved, index_path, summary_path).
+    """
+    carve_dir = summary.get("carve_dir") or os.path.join(run_dir, "carved")
+    by_ext = os.path.join(organized_dir, "by_extension")
+    os.makedirs(by_ext, exist_ok=True)
+
+    moved = 0
+    if os.path.isdir(carve_dir):
+        for name in sorted(os.listdir(carve_dir)):
+            src = os.path.join(carve_dir, name)
+            if not os.path.isfile(src):
+                continue
+            is_sidecar = name.endswith(".triage.txt")
+            if is_sidecar:
+                continue
+            ext = os.path.splitext(name)[1].lstrip(".").lower() or "bin"
+            dest_dir = os.path.join(by_ext, ext)
+            try:
+                os.makedirs(dest_dir, exist_ok=True)
+                shutil.move(src, os.path.join(dest_dir, name))
+                sidecar = src + ".triage.txt"
+                if os.path.isfile(sidecar):
+                    shutil.move(sidecar, os.path.join(dest_dir, name + ".triage.txt"))
+                moved += 1
+            except OSError:
+                continue
+
+    index_path = write_organized_index(organized_dir, summary)
+    if names is None:
+        names = extract_candidate_names(by_ext)
+    summary_path = os.path.join(organized_dir, "summary.txt")
+    try:
+        write_report(summary, names, summary_path)
+    except OSError:
+        summary_path = ""
+    return moved, index_path, summary_path
+
+
+def write_organized_index(organized_dir, summary):
+    """Self-contained index.html over by_extension, with clickable previews."""
+    by_ext = os.path.join(organized_dir, "by_extension")
+    rows = []
+    total_files = 0
+    total_bytes = 0
+    if os.path.isdir(by_ext):
+        for ext in sorted(os.listdir(by_ext)):
+            folder = os.path.join(by_ext, ext)
+            if not os.path.isdir(folder):
+                continue
+            for name in sorted(os.listdir(folder)):
+                if name.endswith(".triage.txt"):
+                    continue
+                path = os.path.join(folder, name)
+                if not os.path.isfile(path):
+                    continue
+                size = os.path.getsize(path)
+                total_files += 1
+                total_bytes += size
+                cls = ""
+                triage = path + ".triage.txt"
+                if os.path.isfile(triage):
+                    try:
+                        with open(triage, "r", encoding="utf-8", errors="replace") as fh:
+                            for line in fh:
+                                if line.startswith("classification"):
+                                    cls = line.split(":", 1)[-1].strip()
+                    except OSError:
+                        cls = ""
+                color = ("#2e7d32" if cls.startswith("TEXT")
+                         else "#c62828" if cls.startswith("COMPRESSED")
+                         else "#616161" if cls.startswith("ZERO") else "#1565c0")
+                rows.append(
+                    "<tr><td>%s</td><td><a href='by_extension/%s/%s'>%s</a></td>"
+                    "<td>%s</td><td style='color:%s'>%s</td></tr>"
+                    % (ext, ext, name, name, fmt_bytes(size), color, cls or "-"))
+    header = [
+        "<!DOCTYPE html>",
+        "<html><head><meta charset='utf-8'><title>fixformat organized recovery</title>",
+        "<style>body{font-family:Segoe UI,Arial,sans-serif;margin:20px;background:#fafafa;color:#222}",
+        "table{border-collapse:collapse;width:100%}th,td{border:1px solid #ccc;padding:6px 10px;text-align:left}",
+        "th{background:#eee} h1{color:#1565c0} .meta{color:#555}</style></head><body>",
+        "<h1>fixformat - organized recovery</h1>",
+        "<p class='meta'>%s &middot; %d files &middot; %s &middot; generated %s</p>"
+        % (os.path.basename(organized_dir), total_files, fmt_bytes(total_bytes),
+           datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+        "<table><tr><th>type</th><th>file</th><th>size</th><th>triage</th></tr>",
+    ]
+    html = header + (rows or ["<tr><td colspan='4'>no recovered file</td></tr>"])
+    html.append("</table></body></html>")
+    index_path = os.path.join(organized_dir, "index.html")
+    try:
+        with open(index_path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(html))
+        return index_path
+    except OSError:
+        return ""
 
 
 # ----------------------------------------------------------------------
@@ -1572,6 +1817,7 @@ def ask_save_location(work_dir):
 # ----------------------------------------------------------------------
 
 def open_target(target):
+    """Open a target read-only and return its size in bytes (0 when unknown)."""
     f = open(target, "rb", buffering=0)   # may raise PermissionError / OSError
     try:
         size = get_device_size(f)
@@ -1687,8 +1933,12 @@ def run_search_flow(target, total):
     print("Press Ctrl+C to stop early - everything found so far is kept.")
     print("-" * 78)
 
-    results_path = os.path.join(SCRIPT_DIR, RESULTS_FILE)
-    carve_dir = os.path.join(SCRIPT_DIR, CARVE_DIR) if ENABLE_CARVING else None
+    # ---- run folders (Section 1 + 2): one pair per run, provenance-stamped ----
+    started_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    recovered_dir, organized_dir, run_id = make_run_dirs(SCRIPT_DIR, target, total)
+    results_path = os.path.join(recovered_dir, RESULTS_FILE)
+    carve_dir = os.path.join(recovered_dir, "carved") if ENABLE_CARVING else None
+    print("results folder  : %s" % recovered_dir)
 
     try:
         summary = scan(target, patterns, CHUNK_SIZE, results_path, carve_dir,
@@ -1716,39 +1966,58 @@ def run_search_flow(target, total):
     print("totals, and the candidate file names inside the recovered data.")
     print()
     names = extract_candidate_names(carve_dir)
-    report_path = os.path.join(SCRIPT_DIR, REPORT_FILE)
-    count, total_bytes = write_report(summary, names, report_path)
-    index_path = os.path.join(SCRIPT_DIR, "index.html")
-    if ENABLE_INDEX_HTML:
-        if write_index_html(summary, names, SCRIPT_DIR, index_path):
-            print("index (html)    : %s" % index_path)
     print_report(summary, names)
-    print()
-    print("results log     : %s" % results_path)
-    print("recovery report : %s" % report_path)
 
-    # ask WHERE to save, after the user has seen names and sizes
-    final_dir = ask_save_location(SCRIPT_DIR)
-    if final_dir != SCRIPT_DIR:
+    # provenance (Section 1): one JSON next to the extracted data
+    provenance = provenance_payload(target, total, summary, patterns,
+                                    case_sensitive, started_at)
+    provenance["run_id"] = run_id
+    provenance["recovered_dir"] = recovered_dir
+    provenance["organized_dir"] = organized_dir
+    provenance["results_log"] = results_path
+    write_provenance(recovered_dir, provenance)
+
+    # organized browsable output (Section 2)
+    moved, index_path, summary_path = organize_output(
+        summary, recovered_dir, organized_dir, names)
+    carved_count = carved_bytes = 0
+    for cur_dir, _dirs, files in os.walk(os.path.join(organized_dir, "by_extension")):
+        for name in files:
+            if name.endswith(".triage.txt"):
+                continue
+            try:
+                carved_bytes += os.path.getsize(os.path.join(cur_dir, name))
+                carved_count += 1
+            except OSError:
+                pass
+
+    print()
+    print("recovered folder : %s" % recovered_dir)
+    print("  results log    : %s" % results_path)
+    print("  provenance     : %s" % os.path.join(recovered_dir, PROVENANCE_FILE))
+    print("organized folder : %s" % organized_dir)
+    print("  by_extension   : %d files, %s" % (carved_count, fmt_bytes(carved_bytes)))
+    if index_path:
+        print("  index (html)   : %s" % index_path)
+    if summary_path:
+        print("  summary        : %s" % summary_path)
+
+    # ask WHERE to keep the two run folders (Section 1/2 keep them siblings)
+    final_root = ask_save_location(SCRIPT_DIR)
+    if final_root:
         try:
-            if carve_dir and os.path.isdir(carve_dir):
-                shutil.move(carve_dir, os.path.join(final_dir, "carved"))
-            for src in (results_path, report_path, index_path):
-                if os.path.isfile(src):
-                    shutil.copy2(src, os.path.join(final_dir, os.path.basename(src)))
-                if os.path.isfile(src):
-                    shutil.copy2(src, os.path.join(final_dir, os.path.basename(src)))
-            count, total_bytes, _ = carved_stats(os.path.join(final_dir, "carved"))
+            new_recovered = shutil.move(recovered_dir, final_root)
+            new_organized = shutil.move(organized_dir, final_root)
             print()
-            print("SAVED TO: %s" % final_dir)
-            print("  recovered files : %d" % count)
-            print("  recovered total : %s (%d bytes)" % (fmt_bytes(total_bytes), total_bytes))
+            print("SAVED TO: %s" % final_root)
+            print("  %s" % new_recovered)
+            print("  %s" % new_organized)
         except OSError as exc:
-            print("Move failed: %s - files remain in %s" % (exc, SCRIPT_DIR))
+            print("Move failed: %s - results remain in %s" % (exc, SCRIPT_DIR))
     if not summary["hits"]:
         print()
-        print("No matches found. Review TARGET_SIGNATURES / MAGIC_SIGNATURES")
-        print("in raw_scan.py and run the scan again.")
+        print("No matches found. Add the file types you need in this run's")
+        print("extension step, or extend the signatures in raw_scan.py.")
 
 
 # ----------------------------------------------------------------------

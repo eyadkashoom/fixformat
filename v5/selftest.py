@@ -193,6 +193,50 @@ def main():
     if not os.path.isfile(img_out + ".info.txt"):
         failures.append("image .info.txt sidecar missing")
 
+    # v5 sections 1-2: provenance-stamped run folders and organized output
+    run_base = os.path.join(tmpdir, "runs")
+    os.makedirs(run_base)
+    recovered_dir, organized_dir, tag = raw_scan.make_run_dirs(
+        run_base, os.path.join(tmpdir, "disk9.img"), 5 * 1024 ** 3)
+    if not tag.startswith("disk9_5.0GB_"):
+        failures.append("run tag = %r" % tag)
+    if os.path.basename(recovered_dir) != "recovered_" + tag:
+        failures.append("recovered folder = %r" % os.path.basename(recovered_dir))
+    if os.path.basename(organized_dir) != "organized_" + tag:
+        failures.append("organized folder = %r" % os.path.basename(organized_dir))
+
+    prov = raw_scan.provenance_payload("/dev/disk9.img", 5 * 1024 ** 3, summary,
+                                       patterns, True, "2026-10-28 12:00:00")
+    raw_scan.write_provenance(recovered_dir, prov)
+    back = raw_scan.read_provenance(recovered_dir)
+    if back.get("source") != "/dev/disk9.img":
+        failures.append("provenance source = %r" % (back.get("source"),))
+    if back.get("hits") != len(summary["hits"]):
+        failures.append("provenance hits = %r, expected %d"
+                        % (back.get("hits"), len(summary["hits"])))
+    if back.get("signatures") != len(patterns):
+        failures.append("provenance signatures = %r" % (back.get("signatures"),))
+
+    moved, idx_path, summ_path = raw_scan.organize_output(summary, recovered_dir,
+                                                          organized_dir)
+    by_ext = os.path.join(organized_dir, "by_extension")
+    ext_dirs = sorted(d for d in os.listdir(by_ext)
+                      if os.path.isdir(os.path.join(by_ext, d)))
+    if moved <= 0 or not ext_dirs:
+        failures.append("organize moved %d files, ext dirs %s" % (moved, ext_dirs))
+    if not idx_path or not os.path.isfile(idx_path):
+        failures.append("organized index.html was not written")
+    else:
+        with open(idx_path, "r", encoding="utf-8") as fh:
+            html_text = fh.read()
+        if "by_extension/" not in html_text:
+            failures.append("organized index.html has no relative links")
+    if not summ_path or not os.path.isfile(summ_path):
+        failures.append("organized summary.txt was not written")
+    runs = raw_scan.find_recoveries(roots=[run_base])
+    if not runs or os.path.abspath(runs[0][0]) != os.path.abspath(recovered_dir):
+        failures.append("find_recoveries did not return the new run folder")
+
     # v5: numbered pickers (sections 11 and 12) - discovery, classification,
     # depth limit and remembered paths, all without any interactive input.
     pick_root = os.path.join(tmpdir, "picks")
