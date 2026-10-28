@@ -1836,6 +1836,169 @@ def write_organized_index(organized_dir, summary):
 
 
 # ----------------------------------------------------------------------
+# V5 Sections 3 and 4: resume a previous recovery, progressive slices
+# ----------------------------------------------------------------------
+
+PROGRESSIVE_PERCENT = 5          # slice size as a percentage of the source
+
+
+def slice_bounds(total, percent, start):
+    """(start, end) of the next slice; end == total on the last one."""
+    if not total:
+        return start, None
+    span = max(SECTOR_SIZE * 2048, int(total * percent / 100.0))
+    return start, min(total, start + span)
+
+
+def merge_summaries(base, part):
+    """Fold one slice's summary into the running one and return `base`."""
+    base["hits"].extend(part.get("hits") or [])
+    for label, count in (part.get("counts") or {}).items():
+        base["counts"][label] = base["counts"].get(label, 0) + count
+    for key in ("carved_files", "bytes_scanned", "zero_bytes"):
+        base[key] = base.get(key, 0) + (part.get(key) or 0)
+    base["elapsed"] = base.get("elapsed", 0.0) + (part.get("elapsed") or 0.0)
+    base["interrupted"] = bool(part.get("interrupted"))
+    base["carve_dir"] = part.get("carve_dir") or base.get("carve_dir")
+    base["results_path"] = part.get("results_path") or base.get("results_path")
+    return base
+
+
+def ask_resume():
+    """
+    Section 3: offer to continue a previous recovery.
+    Returns (target, provenance, resume_offset) or None for a fresh run.
+    """
+    found = find_recoveries()
+    if not found:
+        return None
+    print()
+    print("-" * 78)
+    print("A previous recovery was found - do you want to continue one?")
+    print("-" * 78)
+    for index, (path, prov) in enumerate(found[:15], 1):
+        done = prov.get("resume_offset") or 0
+        total = prov.get("source_size") or 0
+        pct = ("%.1f%%" % (100.0 * done / total)) if total and done else "?"
+        print("  [%d] %-44s %8s  %s" % (index, _shorten(os.path.basename(path), 44),
+                                        pct, prov.get("status", "?")))
+    print("-" * 78)
+    print("  [0] Type the folder path manually")
+    print("  [N] Start a new recovery instead")
+    answer, ok = _ask("Your choice [N]: ")
+    if not ok:
+        return None
+    answer = answer.strip()
+    if not answer or answer.lower() in ("n", "q"):
+        return None
+    path = None
+    if answer == "0":
+        typed, ok_path = _ask("Recovered folder path: ")
+        if not ok_path:
+            return None
+        typed = typed.strip().strip('"').strip("'")
+        path = os.path.abspath(os.path.expanduser(typed)) if typed else None
+    elif answer.isdigit():
+        index = int(answer) - 1
+        if 0 <= index < len(found):
+            path = found[index][0]
+    if not path or not os.path.isdir(path):
+        print("No usable folder chosen - starting a new recovery.")
+        return None
+    prov = read_provenance(path)
+    if not prov or not prov.get("source"):
+        print("That folder has no provenance.json - starting a new recovery.")
+        return None
+    prov["recovered_dir"] = path
+    remember_path("recovered", os.path.dirname(path))
+    return prov["source"], prov, int(prov.get("resume_offset") or 0)
+
+
+def run_progressive(target, total, patterns, case_sensitive, recovered_dir,
+                    organized_dir, started_at, resume_from=0, tag="",
+                    percent=PROGRESSIVE_PERCENT):
+    """
+    Section 4: scan `target` in slices. After every slice the carved data is
+    organized, provenance.json is updated with the offset to resume from, and
+    the user is asked whether to take the next slice. Returns the combined
+    summary (with "resume_offset" and "stopped_early").
+    """
+    carve_dir = os.path.join(recovered_dir, "carved") if ENABLE_CARVING else None
+    results_path = os.path.join(recovered_dir, RESULTS_FILE)
+    combined = {"target": target, "total_size": total, "hits": [], "counts": {},
+                "carved_files": 0, "bytes_scanned": 0, "zero_bytes": 0,
+                "elapsed": 0.0, "interrupted": False,
+                "results_path": results_path, "carve_dir": carve_dir,
+                "resume_offset": int(resume_from or 0), "stopped_early": False}
+
+    start = max(0, int(resume_from or 0))
+    if total and start >= total:
+        print("This recovery already reached the end of the source (%s)." % fmt_bytes(total))
+        combined["resume_offset"] = total
+        return combined
+
+    slice_no = 0
+    while True:
+        slice_no += 1
+        end = slice_bounds(total, percent, start)[1]
+        where = "%s - %s" % (fmt_bytes(start),
+                             fmt_bytes(end) if end is not None else "end of media")
+        print()
+        print("=" * 78)
+        print("SLICE %d - %s" % (slice_no, where))
+        print("=" * 78)
+        try:
+            part = scan(target, patterns, CHUNK_SIZE, results_path, carve_dir,
+                        CARVE_BEFORE, CARVE_AFTER, show_progress=True,
+                        min_gap=MIN_GAP, carve_limit=CARVE_LIMIT,
+                        start_offset=start, end_offset=end)
+        except KeyboardInterrupt:
+            print("\nStopped by the user - everything found so far is kept.")
+            combined["stopped_early"] = True
+            break
+        merge_summaries(combined, part)
+
+        # organize this slice's files, then record where to continue from
+        organize_output(part, recovered_dir, organized_dir)
+        combined["resume_offset"] = end if end is not None else (
+            combined["bytes_scanned"] + start)
+        finished = end is None or (total and end >= total)
+        prov = provenance_payload(target, total, combined, patterns,
+                                  case_sensitive, started_at)
+        prov.update({"run_id": tag, "recovered_dir": recovered_dir,
+                     "organized_dir": organized_dir,
+                     "resume_offset": combined["resume_offset"],
+                     "status": "complete" if finished else "in progress"})
+        write_provenance(recovered_dir, prov)
+
+        print()
+        print("Slice done: %d hits so far, %d files carved, saved at offset %s"
+              % (len(combined["hits"]), combined["carved_files"],
+                 fmt_bytes(combined["resume_offset"])))
+        if finished:
+            print("The whole source has been scanned.")
+            break
+        answer, ok = _ask("Continue with the next slice? [Y/n]: ")
+        if not ok or answer.strip().lower() in ("n", "no", "q"):
+            print("Stopped. Run the tool again and choose this recovery to continue.")
+            combined["stopped_early"] = True
+            break
+        start = combined["resume_offset"]
+
+    # final organized view + summary over everything found so far
+    organize_output(combined, recovered_dir, organized_dir)
+    prov = provenance_payload(target, total, combined, patterns, case_sensitive,
+                              started_at)
+    prov.update({"run_id": tag, "recovered_dir": recovered_dir,
+                 "organized_dir": organized_dir,
+                 "resume_offset": combined["resume_offset"],
+                 "status": ("complete" if not combined["stopped_early"]
+                            else "interrupted")})
+    write_provenance(recovered_dir, prov)
+    return combined
+
+
+# ----------------------------------------------------------------------
 # main
 # ----------------------------------------------------------------------
 
@@ -1945,6 +2108,9 @@ def run_search_flow(target, total):
         print("Stopped. Nothing was scanned.")
         sys.exit(0)
 
+    slice_answer, slice_ok = _ask("Scan in 5%% slices with a checkpoint after each? [y/N]: ")
+    progressive = slice_ok and slice_answer.strip().lower() in ("y", "yes")
+
     # ---------------- STEP 5 ----------------
     print()
     print("=" * 78)
@@ -1964,9 +2130,15 @@ def run_search_flow(target, total):
     print("results folder  : %s" % recovered_dir)
 
     try:
-        summary = scan(target, patterns, CHUNK_SIZE, results_path, carve_dir,
-                       CARVE_BEFORE, CARVE_AFTER, min_gap=MIN_GAP,
-                       carve_limit=CARVE_LIMIT)
+        if progressive:
+            print("Slices of %d%% with a checkpoint after each one." % PROGRESSIVE_PERCENT)
+            summary = run_progressive(target, total, patterns, case_sensitive,
+                                      recovered_dir, organized_dir, started_at,
+                                      tag=run_id)
+        else:
+            summary = scan(target, patterns, CHUNK_SIZE, results_path, carve_dir,
+                           CARVE_BEFORE, CARVE_AFTER, min_gap=MIN_GAP,
+                           carve_limit=CARVE_LIMIT)
     except PermissionError:
         print("\nERROR: access denied.")
         print("Raw device reads require administrator / SYSTEM rights.")
@@ -2457,6 +2629,38 @@ def main():
     print("This tool never writes to the disk it reads. Every step below is")
     print("explained on screen and asks you what to do.")
     print()
+    resumed = ask_resume()
+    if resumed:
+        resume_target, resume_prov, resume_offset = resumed
+        resume_total = int(resume_prov.get("source_size") or 0)
+        labels = set(resume_prov.get("signature_labels") or [])
+        resume_case = bool(resume_prov.get("case_sensitive", True))
+        resume_patterns = [p for p in build_patterns(resume_case)
+                           if not labels or p[0] in labels]
+        recovered_dir = resume_prov.get("recovered_dir") or ""
+        organized_dir = resume_prov.get("organized_dir") or ""
+        if not organized_dir or not os.path.isdir(organized_dir):
+            organized_dir = os.path.join(
+                os.path.dirname(recovered_dir),
+                os.path.basename(recovered_dir).replace(RECOVERED_PREFIX,
+                                                        ORGANIZED_PREFIX, 1))
+            os.makedirs(organized_dir, exist_ok=True)
+        print()
+        print("Continuing %s from %s with %d signatures"
+              % (resume_target, fmt_bytes(resume_offset), len(resume_patterns)))
+        combined = run_progressive(resume_target, resume_total, resume_patterns,
+                                   resume_case, recovered_dir, organized_dir,
+                                   resume_prov.get("started") or "",
+                                   resume_from=resume_offset,
+                                   tag=resume_prov.get("run_id", ""))
+        print()
+        print("Recovery updated: %d hits, %d files carved, resume offset %s"
+              % (len(combined["hits"]), combined["carved_files"],
+                 fmt_bytes(combined["resume_offset"])))
+        print("  recovered : %s" % recovered_dir)
+        print("  organized : %s" % organized_dir)
+        return
+
     print("=" * 78)
     print("MAIN MENU - CHOOSE WHAT TO DO")
     print("=" * 78)
