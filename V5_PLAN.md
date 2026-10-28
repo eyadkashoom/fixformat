@@ -476,7 +476,7 @@ and mmap (13.6) only pays on repeated scans of the same image.
 | 1 | **done** | `pick_image` / `pick_folder` / `pick_destination` + `last_paths.json`; wired into the image source, the imaging destination and the recovered-data root; selftest covers discovery, depth limit, partial flag and remembered paths; driven interactively with scripted answers (menu, selection, partial confirmation, cancel) |
 | 2 | **done** | 256 MB fixture: 92.7 s -> 48.6 s (1.9x), identical hits and offsets; 13.2 measured and rejected (see 13.8) |
 | 3 | **done** (plus 13.4b and 13.5 pulled forward) | two-phase carve (`CachedReader` + `carve_phase`), triage moved to C, parallel phase 1 with a sequential fallback. 92.7 s -> 21.6 s (**4.3x**), same digest, same 75 carved files. Selftest now asserts parallel hits == sequential hits |
-| 4 | partly done | **Sections 1 + 2 done**: `recovered_<label>_<size>_<stamp>/` with `provenance.json`, `organized_<...>/by_extension/<ext>/` + `index.html` + `summary.txt`, one pair per run, verified end-to-end on a real scan. Sections 3 (resume) and 4 (progressive 5%) still to do - they need `scan(start_offset, end_offset)` |
+| 4 | foundation done | **Sections 1 + 2 done** and verified end-to-end: `recovered_<label>_<size>_<stamp>/` + `provenance.json`, `organized_*/by_extension/<ext>/` + `index.html` + `summary.txt`. Also done: `scan(start_offset, end_offset)` with bounded reads - a full scan split into two halves yields exactly the full-scan hits (`stitched == full : True`, A=4564 B=5032 of 9128 bytes). **Remaining: the resume prompt and the 5% progressive driver** that call it |
 
 ## Next step
 

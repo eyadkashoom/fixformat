@@ -1102,21 +1102,22 @@ def _scan_range_worker(job):
     return hits
 
 
-def parallel_phase1(target, patterns, total_size, chunk_size, workers, min_gap,
-                    show_progress=True):
+def parallel_phase1(target, patterns, start_offset, end_offset, chunk_size, workers,
+                    min_gap, show_progress=True):
     """
-    Split the source into `workers` byte ranges and scan them in parallel
+    Split the source range into `workers` byte ranges and scan them in parallel
     processes (bytes.find holds the GIL, so threads would not help). Returns the
     merged hits with MIN_GAP applied in local order, which is what one
     sequential pass produced.
     """
     import multiprocessing
 
-    step = max(chunk_size, ((total_size + workers - 1) // workers // chunk_size) * chunk_size)
+    span = max(0, end_offset - start_offset)
+    step = max(chunk_size, ((span + workers - 1) // workers // chunk_size) * chunk_size)
     jobs = []
-    start = 0
-    while start < total_size:
-        end = min(total_size, start + step)
+    start = start_offset
+    while start < end_offset:
+        end = min(end_offset, start + step)
         jobs.append((target, patterns, start, end, chunk_size))
         start = end
 
@@ -1144,9 +1145,12 @@ def parallel_phase1(target, patterns, total_size, chunk_size, workers, min_gap,
 
 def scan(target, patterns, chunk_size, results_path, carve_dir=None,
          carve_before=4096, carve_after=65536, show_progress=True,
-         min_gap=0, carve_limit=0):
+         min_gap=0, carve_limit=0, start_offset=0, end_offset=None):
     """
     Scan `target` for `patterns` = (label, bytes, ext, case_insensitive) tuples.
+    `start_offset`/`end_offset` restrict the scan to one byte range (progressive
+    scanning and resume, V5 Sections 3 and 4); hits before `start_offset` are
+    dropped so each range owns its own hits.
     Returns a summary dict (see below).
     """
     if not patterns:
@@ -1202,6 +1206,14 @@ def scan(target, patterns, chunk_size, results_path, carve_dir=None,
         last_progress = [0.0]
         pending = []
 
+        # ---- restrict the scan to [start_offset, end_offset) if requested ----
+        start_offset = max(0, int(start_offset or 0))
+        if end_offset is None or (total_size and end_offset > total_size):
+            end_offset = total_size or None
+        if end_offset is not None and end_offset <= start_offset:
+            raise ValueError("end_offset must be greater than start_offset")
+        range_total = (end_offset - start_offset) if (end_offset and start_offset) else (end_offset or 0)
+
         def update_progress(force=False):
             if not show_progress:
                 return
@@ -1231,8 +1243,8 @@ def scan(target, patterns, chunk_size, results_path, carve_dir=None,
         if workers > 1 and total_size and total_size >= PARALLEL_MIN_SIZE:
             try:
                 print("Scanning %s in %d parallel ranges ..." % (fmt_bytes(total_size), workers))
-                found = parallel_phase1(target, patterns, total_size, chunk_size,
-                                        workers, min_gap, show_progress)
+                found = parallel_phase1(target, patterns, start_offset, end_offset,
+                                        chunk_size, workers, min_gap, show_progress)
                 hits.extend(found)
                 counts = dict((p[0], 0) for p in pat_list)
                 for hit in hits:
@@ -1258,9 +1270,18 @@ def scan(target, patterns, chunk_size, results_path, carve_dir=None,
         if not use_parallel and workers > 1 and total_size and total_size < PARALLEL_MIN_SIZE:
             log("parallel     : off (source smaller than %s)" % fmt_bytes(PARALLEL_MIN_SIZE))
 
+        if not use_parallel:
+            aligned_start = (max(0, start_offset - carry_len) // DEVICE_ALIGNMENT) * DEVICE_ALIGNMENT
+            f.seek(aligned_start)
+            next_off = aligned_start
+
         try:
             while not use_parallel:
-                chunk = read_exact(f, chunk_size)
+                if end_offset is not None and next_off >= end_offset:
+                    break
+                to_read = (chunk_size if end_offset is None
+                           else min(chunk_size, end_offset - next_off))
+                chunk = read_exact(f, to_read)
                 if not chunk:
                     break
 
@@ -1287,6 +1308,8 @@ def scan(target, patterns, chunk_size, results_path, carve_dir=None,
                 for label, ext, plen, abs_off in match_block(hay, hay_low, pat_list,
                                                              base, carry_floor,
                                                              last_hit, min_gap):
+                    if abs_off < start_offset:
+                        continue
                     sector = abs_off // SECTOR_SIZE
                     hits.append({"label": label, "offset": abs_off,
                                  "sector": sector, "carved": "",
@@ -1307,7 +1330,7 @@ def scan(target, patterns, chunk_size, results_path, carve_dir=None,
                 next_off += len(chunk)
                 update_progress()
 
-                if len(chunk) < chunk_size:
+                if len(chunk) < to_read:
                     break
                 carry = combined[-carry_len:] if carry_len else b""
         except KeyboardInterrupt:
