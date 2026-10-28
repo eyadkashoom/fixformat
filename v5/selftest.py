@@ -14,10 +14,12 @@ Checks:
 """
 
 import hashlib
+import inspect
 import os
 import shutil
 import sys
 import tempfile
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -307,6 +309,120 @@ def main():
         raw_scan.PARALLEL_WORKERS = saved_workers
         raw_scan.PARALLEL_MIN_SIZE = saved_min_size
 
+    # v5 sections 5, 9, 10: fast scan (regions, budget, no carving, report,
+    # projection), the speed memory behind the time estimate and the six-item
+    # main menu.
+    for total_size, pct, expect in ((100000, 5, [(0, 5000), (95000, 100000)]),
+                                    (100, 50, [(0, 100)]),
+                                    (0, 5, [(0, None)])):
+        got_ranges = raw_scan.fast_scan_ranges(total_size, pct)
+        if got_ranges != expect:
+            failures.append("fast_scan_ranges(%r, %r) = %r, expected %r"
+                            % (total_size, pct, got_ranges, expect))
+
+    # a deadline that has already passed must stop before reading a single byte
+    past = raw_scan.scan(img, patterns, CHUNK,
+                         os.path.join(tmpdir, "deadline.txt"), None,
+                         show_progress=False, min_gap=0,
+                         deadline=time.time() - 1)
+    if past["hits"] or not past.get("budget_hit") or past["bytes_scanned"]:
+        failures.append("deadline stop: hits=%d budget_hit=%r scanned=%d"
+                        % (len(past["hits"]), past.get("budget_hit"),
+                           past["bytes_scanned"]))
+
+    # fast scan on a 4 MB image: one signature in the first 5%, one in the
+    # unscanned middle, one in the last 5%
+    fast_img = os.path.join(tmpdir, "fast.img")
+    unit = 4 * 1024 * 1024
+    blob = bytearray(b"\x01" * unit)
+    for offset, tag in ((1024, b"notes_head_1.md"),
+                        (unit // 2, b"notes_middle_2.md"),
+                        (unit - 4096, b"notes_tail_3.md")):
+        blob[offset:offset + 3] = b".md"
+        blob[offset + 8:offset + 8 + len(tag)] = tag
+    with open(fast_img, "wb") as fh:
+        fh.write(bytes(blob))
+
+    md_only = [("md ext [utf-8]", b".md", "md", False)]
+    saved_gap = raw_scan.MIN_GAP
+    raw_scan.MIN_GAP = 0
+    try:
+        fast = raw_scan.run_fast_scan(fast_img, unit, md_only, True, budget=60,
+                                      base_dir=os.path.join(tmpdir, "fastruns"))
+    finally:
+        raw_scan.MIN_GAP = saved_gap
+
+    head_span = unit * 5 // 100
+    tail_start = unit - head_span
+    offsets = [h["offset"] for h in fast["hits"]]
+    if not any(o < head_span for o in offsets):
+        failures.append("fast scan missed the head region")
+    if not any(o >= tail_start for o in offsets):
+        failures.append("fast scan missed the tail region")
+    if any(head_span <= o < tail_start for o in offsets):
+        failures.append("fast scan reported a hit outside the sampled regions: %r"
+                        % [o for o in offsets if head_span <= o < tail_start])
+    if not (2 * head_span <= fast["sampled_bytes"] <= 2 * head_span + 3 * 4096):
+        failures.append("fast scan sampled_bytes = %d, expected about %d"
+                        % (fast["sampled_bytes"], 2 * head_span))
+    if fast["carved_files"] or os.path.isdir(os.path.join(fast["fast_dir"], "carved")):
+        failures.append("fast scan carved files (it must not)")
+    if not fast.get("report_path") or not os.path.isfile(fast["report_path"]):
+        failures.append("fast scan report was not written")
+    else:
+        with open(fast["report_path"], "r", encoding="utf-8") as fh:
+            fast_text = fh.read()
+        for needle in ("FAST SCAN RESULT", "RECOMMENDATION", "zero regions",
+                       "PROJECTION"):
+            if needle not in fast_text:
+                failures.append("fast scan report is missing %r" % needle)
+    if not os.path.isfile(os.path.join(fast["fast_dir"], raw_scan.PROVENANCE_FILE)):
+        failures.append("fast scan provenance.json was not written")
+    fast_names = set(name for name, _ in fast["names"])
+    if "notes_head_1.md" not in fast_names:
+        failures.append("fast scan sample names = %s" % sorted(fast_names)[:8])
+    if not fast["projection"].get("usable") or fast["projection"]["projected_hits"] <= 0:
+        failures.append("fast scan projection = %r" % (fast["projection"],))
+
+    # a budget that is already exhausted (negative = a deadline in the past)
+    # must return a partial run with nothing scanned, not scan anyway
+    tiny = raw_scan.run_fast_scan(fast_img, unit, md_only, True, budget=-1,
+                                  base_dir=os.path.join(tmpdir, "fastruns"))
+    if tiny["hits"] or not tiny["budget_hit"] or tiny["sampled_bytes"]:
+        failures.append("exhausted budget: hits=%d budget_hit=%r sampled=%d"
+                        % (len(tiny["hits"]), tiny["budget_hit"],
+                           tiny["sampled_bytes"]))
+
+    # speed memory behind the pre-scan estimate (Section 10)
+    saved_speed_file = raw_scan.SPEED_FILE
+    raw_scan.SPEED_FILE = os.path.join(tmpdir, "scan_speed.json")
+    try:
+        if raw_scan.load_speed_rates():
+            failures.append("speed memory did not start empty")
+        measured_rate = 100 * 1024 * 1024
+        raw_scan.remember_speed("image", measured_rate)
+        rates = raw_scan.load_speed_rates()
+        if abs((rates.get("image") or 0) - measured_rate) > 1:
+            failures.append("remember_speed stored %r" % (rates.get("image"),))
+        secs, measured = raw_scan.estimate_scan_seconds(
+            measured_rate, os.path.join(tmpdir, "x.img"), rates)
+        if not measured or abs(secs - 1.0) > 0.01:
+            failures.append("measured estimate = (%r, %r)" % (secs, measured))
+        secs, measured = raw_scan.estimate_scan_seconds(
+            measured_rate, os.path.join(tmpdir, "y.img"), {})
+        if measured or abs(secs - measured_rate / float(raw_scan.DEFAULT_SCAN_RATE)) > 1:
+            failures.append("default estimate = (%r, %r)" % (secs, measured))
+    finally:
+        raw_scan.SPEED_FILE = saved_speed_file
+
+    # the six-item main menu (Section 9)
+    menu_src = inspect.getsource(raw_scan.main)
+    for needle in ("1 - FAST SCAN", "2 - FULL SCAN", "3 - PROGRESSIVE SCAN",
+                   "4 - CREATE DISK IMAGE", "5 - ANALYZE EXISTING IMAGE",
+                   "6 - RESUME PREVIOUS RECOVERY"):
+        if needle not in menu_src:
+            failures.append("main menu is missing %r" % needle)
+
     # results log must contain every reported hit
     with open(results, "r", encoding="utf-8") as fh:
         log_text = fh.read()
@@ -327,6 +443,8 @@ def main():
     print("case-sensitive/insensitive matching verified, carved files contain their patterns,")
     print("candidate file names extracted (%d names), recovery report written," % len(names))
     print("image picker discovery/depth/partial flags and remembered paths verified.")
+    print("fast scan verified: 5%+5% regions, budget stop, no carving, report+projection,")
+    print("speed memory for the time estimate and the six-item main menu.")
     shutil.rmtree(tmpdir, ignore_errors=True)
     sys.exit(0)
 

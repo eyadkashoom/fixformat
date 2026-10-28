@@ -476,12 +476,20 @@ and mmap (13.6) only pays on repeated scans of the same image.
 | 1 | **done** | `pick_image` / `pick_folder` / `pick_destination` + `last_paths.json`; wired into the image source, the imaging destination and the recovered-data root; selftest covers discovery, depth limit, partial flag and remembered paths; driven interactively with scripted answers (menu, selection, partial confirmation, cancel) |
 | 2 | **done** | 256 MB fixture: 92.7 s -> 48.6 s (1.9x), identical hits and offsets; 13.2 measured and rejected (see 13.8) |
 | 3 | **done** (plus 13.4b and 13.5 pulled forward) | two-phase carve (`CachedReader` + `carve_phase`), triage moved to C, parallel phase 1 with a sequential fallback. 92.7 s -> 21.6 s (**4.3x**), same digest, same 75 carved files. Selftest now asserts parallel hits == sequential hits |
-| 4 | foundation done | **Sections 1 + 2 done** and verified end-to-end: `recovered_<label>_<size>_<stamp>/` + `provenance.json`, `organized_*/by_extension/<ext>/` + `index.html` + `summary.txt`. Also done: `scan(start_offset, end_offset)` with bounded reads - a full scan split into two halves yields exactly the full-scan hits (`stitched == full : True`, A=4564 B=5032 of 9128 bytes). **Remaining: the resume prompt and the 5% progressive driver** that call it |
+| 4 | **done** | **Sections 1 + 2**: `recovered_<label>_<size>_<stamp>/` + `provenance.json`, `organized_*/by_extension/<ext>/` + `index.html` + `summary.txt`, and `scan(start_offset, end_offset)` with bounded reads (a full scan split into two halves yields exactly the full-scan hits, A=4564 B=5032 of 9128 bytes). **Sections 3 + 4**: `run_progressive()` (5% slices, checkpoint + `resume_offset`/`status` after each one) and `ask_resume()` (numbered list of `recovered_*` folders or a typed path, signatures rebuilt from provenance). Verified: stop after slice 1 -> `interrupted` at 1 MB, resume -> `complete` at 3.89 MB, stitched hits == full scan (2 == 2). Commit `13d9849` |
+| 5 | **done** | **Sections 5 + 9 + 10.** Fast scan: `fast_scan_ranges()` (first+last 5%, one pass when the two touch), a hard clock budget threaded through `scan(deadline=)`, `parallel_phase1(deadline=)` and the child worker, reduced 2 KB/16 KB windows, no carving at all, on-the-fly sample names, density projection (capped by `CARVE_LIMIT`), zero-region/TRIM reporting and the >50-hit / 0-hit recommendation gate; output is `fastscan_<label>_<size>_<stamp>/` with `fast_scan_report.txt` + `provenance.json`. Six-item menu with a disk-or-image source picker, and a pre-scan `PLAN FOR THIS RUN` block (mode, coverage, signatures, estimated time from the last measured run in `scan_speed.json`). Verified by scripted runs: 100 MB image, parallel on, hits only in the sampled regions (2048 / 104849408 found, 52428800 correctly absent), `sampled_bytes` = 10.00 MB exactly, names from both regions, projection 40 hits / 2.66 MB; exhausted budget -> 0 hits + `budget_hit`; menu options 1/2/3/6 driven end-to-end; `v5/selftest.py` PASS (now covers ranges, budget stop, no-carve, report, projection, speed memory, menu) and `v4/selftest.py` still PASS |
 
 ## Next step
 
-Planning is complete: 13 sections, all decisions recorded, and the base is
-fixed as `v4/`. The full-disk imaging trial on this machine is **not** a
-prerequisite for v5 - the imaging engine was already exercised successfully
-(raw and gzip, SHA-256 match) and the feature is confirmed working by the
-user. Awaiting go-ahead to start at step 0.
+Steps 0-5 are done and committed. **Step 6 is next**: Sections 7 + 8 - JSON
+signature profile loading (`--profile` / a menu choice, ~25 signatures instead of
+81, which is the biggest remaining speed lever) and SMB / network-share output
+for the recovered folders. Then step 7 (mmap for image files + a benchmark on
+real media) and step 8 (same-disk refusal on the destination, tag `v5.0.0`,
+release with `python-embed.zip`, add v5 to CI).
+
+The full-disk imaging trial on this machine is **not** a prerequisite for v5 -
+the imaging engine was already exercised successfully (raw and gzip, SHA-256
+match) and the user confirmed the feature works. Nothing in v5 has been run on a
+real disk or real image yet: every measurement above is on synthetic media
+(256 MB, 100 MB, 4 MB, 3.89 MB fixtures).

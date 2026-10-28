@@ -9,6 +9,9 @@ search_results.txt
 recovery_report.txt
 *.img
 last_paths.json
+fastscan_*/
+fast_scan_report.txt
+scan_speed.json
 
 # Python
 __pycache__/

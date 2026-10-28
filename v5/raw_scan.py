@@ -1054,8 +1054,12 @@ def _scan_range_worker(job):
     that START inside its own [start, end) so adjacent ranges never report the
     same hit twice. MIN_GAP is NOT applied here - the parent applies it over the
     merged, offset-ordered hits, which is exactly what one sequential pass did.
+    `job[5]` (optional) is an absolute time.time() deadline: the worker stops
+    reading when it passes it and reports budget_hit, which is what keeps the
+    fast scan inside its time budget (V5 Section 5).
     """
-    target, patterns, start, end, chunk_size = job
+    target, patterns, start, end, chunk_size = job[:5]
+    deadline = job[5] if len(job) > 5 else None
     pat_list = build_pat_list(patterns)
     max_len = max(len(p[1]) for p in pat_list)
     carry_len = max_len - 1
@@ -1063,6 +1067,9 @@ def _scan_range_worker(job):
 
     hits = []
     local_hit = {}
+    scanned = 0
+    zero_bytes = 0
+    budget_hit = False
     read_from = max(0, start - carry_len)
     aligned = (read_from // DEVICE_ALIGNMENT) * DEVICE_ALIGNMENT
     # Read a little PAST `end`: a pattern can start just before the range
@@ -1075,13 +1082,21 @@ def _scan_range_worker(job):
         carry = b""
         next_off = aligned
         while next_off < read_limit:
-            chunk = read_exact(f, chunk_size)
+            if deadline is not None and time.time() > deadline:
+                budget_hit = True
+                break
+            # never read past this range's own window: the fast scan slices are
+            # smaller than one block, and reading 8 MB to scan 5 MB wastes the
+            # budget it is trying to stay inside
+            chunk = read_exact(f, min(chunk_size, read_limit - next_off))
             if not chunk:
                 break
             combined = carry + chunk
             base = next_off - len(carry)
             carry_floor = len(carry)
-            if chunk == zero_block(len(chunk)):
+            is_zero = chunk == zero_block(len(chunk))
+            if is_zero:
+                zero_bytes += len(chunk)
                 hay = combined[:min(len(combined), carry_floor + max_len)]
             else:
                 hay = combined
@@ -1093,22 +1108,25 @@ def _scan_range_worker(job):
                     hits.append({"label": label, "offset": abs_off,
                                  "sector": abs_off // SECTOR_SIZE,
                                  "carved": "", "ext": ext, "plen": plen})
+            scanned += len(chunk)
             next_off += len(chunk)
             if len(chunk) < chunk_size:
                 break
             carry = combined[-carry_len:] if carry_len else b""
     finally:
         f.close()
-    return hits
+    return {"hits": hits, "scanned": scanned, "zero_bytes": zero_bytes,
+            "budget_hit": budget_hit}
 
 
 def parallel_phase1(target, patterns, start_offset, end_offset, chunk_size, workers,
-                    min_gap, show_progress=True):
+                    min_gap, show_progress=True, deadline=None):
     """
     Split the source range into `workers` byte ranges and scan them in parallel
-    processes (bytes.find holds the GIL, so threads would not help). Returns the
-    merged hits with MIN_GAP applied in local order, which is what one
-    sequential pass produced.
+    processes (bytes.find holds the GIL, so threads would not help). Returns
+    {"hits": merged hits with MIN_GAP applied in local order (what one
+    sequential pass produced), "scanned": bytes actually read,
+    "zero_bytes": all-zero bytes seen, "budget_hit": a worker ran out of time}.
     """
     import multiprocessing
 
@@ -1118,14 +1136,20 @@ def parallel_phase1(target, patterns, start_offset, end_offset, chunk_size, work
     start = start_offset
     while start < end_offset:
         end = min(end_offset, start + step)
-        jobs.append((target, patterns, start, end, chunk_size))
+        jobs.append((target, patterns, start, end, chunk_size, deadline))
         start = end
 
     parts = []
+    scanned = 0
+    zero_bytes = 0
+    budget_hit = False
     ctx = multiprocessing.get_context("spawn")
     with ctx.Pool(processes=min(workers, len(jobs))) as pool:
         for done, part in enumerate(pool.imap_unordered(_scan_range_worker, jobs), 1):
-            parts.extend(part)
+            parts.extend(part.get("hits") or [])
+            scanned += part.get("scanned") or 0
+            zero_bytes += part.get("zero_bytes") or 0
+            budget_hit = budget_hit or bool(part.get("budget_hit"))
             if show_progress:
                 sys.stdout.write("\rParallel phase 1: %d / %d ranges done, %d hits   "
                                  % (done, len(jobs), len(parts)))
@@ -1140,17 +1164,21 @@ def parallel_phase1(target, patterns, start_offset, end_offset, chunk_size, work
         if _reportable(last_hit, hit["label"], hit["offset"], min_gap):
             kept.append(hit)
     kept.sort(key=lambda h: (h["label"], h["offset"]))
-    return kept
+    return {"hits": kept, "scanned": scanned, "zero_bytes": zero_bytes,
+            "budget_hit": budget_hit}
 
 
 def scan(target, patterns, chunk_size, results_path, carve_dir=None,
          carve_before=4096, carve_after=65536, show_progress=True,
-         min_gap=0, carve_limit=0, start_offset=0, end_offset=None):
+         min_gap=0, carve_limit=0, start_offset=0, end_offset=None,
+         deadline=None):
     """
     Scan `target` for `patterns` = (label, bytes, ext, case_insensitive) tuples.
     `start_offset`/`end_offset` restrict the scan to one byte range (progressive
     scanning and resume, V5 Sections 3 and 4); hits before `start_offset` are
-    dropped so each range owns its own hits.
+    dropped so each range owns its own hits. `deadline` (absolute time.time())
+    stops the read early and sets summary["budget_hit"] - the fast scan's time
+    budget (V5 Section 5).
     Returns a summary dict (see below).
     """
     if not patterns:
@@ -1175,6 +1203,7 @@ def scan(target, patterns, chunk_size, results_path, carve_dir=None,
     zero_bytes = 0
     use_parallel = False
     interrupted = False
+    budget_hit = False
     started = time.time()
 
     def now():
@@ -1244,8 +1273,9 @@ def scan(target, patterns, chunk_size, results_path, carve_dir=None,
             try:
                 print("Scanning %s in %d parallel ranges ..." % (fmt_bytes(total_size), workers))
                 found = parallel_phase1(target, patterns, start_offset, end_offset,
-                                        chunk_size, workers, min_gap, show_progress)
-                hits.extend(found)
+                                        chunk_size, workers, min_gap, show_progress,
+                                        deadline=deadline)
+                hits.extend(found["hits"])
                 counts = dict((p[0], 0) for p in pat_list)
                 for hit in hits:
                     counts[hit["label"]] = counts.get(hit["label"], 0) + 1
@@ -1258,7 +1288,22 @@ def scan(target, patterns, chunk_size, results_path, carve_dir=None,
                     print()
                     print("\n".join(pending))
                     del pending[:]
-                scanned = total_size
+                budget_hit = bool(found.get("budget_hit"))
+                zero_bytes += found.get("zero_bytes") or 0
+                # "bounded" = this call owns a SLICE of the source, not the
+                # whole source (the tail slice ends exactly at the source end,
+                # so start_offset has to be part of the test)
+                bounded = (start_offset > 0
+                           or (end_offset is not None and total_size
+                               and end_offset < total_size))
+                if budget_hit or bounded:
+                    # honest byte count for a partial or bounded pass: only the
+                    # ranges that actually finished were read
+                    measured = found.get("scanned") or 0
+                    span = (end_offset - start_offset) if end_offset else measured
+                    scanned = min(measured, span) if span else measured
+                else:
+                    scanned = total_size
                 use_parallel = True
             except Exception as exc:      # a broken pool must never lose the scan
                 log("parallel phase failed: %s - falling back to one process" % exc)
@@ -1278,6 +1323,10 @@ def scan(target, patterns, chunk_size, results_path, carve_dir=None,
         try:
             while not use_parallel:
                 if end_offset is not None and next_off >= end_offset:
+                    break
+                if deadline is not None and time.time() > deadline:
+                    budget_hit = True
+                    interrupted = True
                     break
                 to_read = (chunk_size if end_offset is None
                            else min(chunk_size, end_offset - next_off))
@@ -1371,6 +1420,7 @@ def scan(target, patterns, chunk_size, results_path, carve_dir=None,
             "counts": counts,
             "carved_files": carved_files,
             "interrupted": interrupted,
+            "budget_hit": budget_hit,
             "results_path": results_path,
             "carve_dir": carve_dir,
         }
@@ -1864,13 +1914,18 @@ def merge_summaries(base, part):
     return base
 
 
-def ask_resume():
+def ask_resume(force=False):
     """
     Section 3: offer to continue a previous recovery.
     Returns (target, provenance, resume_offset) or None for a fresh run.
+    `force` is the explicit menu option: it explains itself when there is
+    nothing to continue instead of returning silently.
     """
     found = find_recoveries()
     if not found:
+        if force:
+            print("No recovered_* folder was found next to this script.")
+            print("Nothing to continue - start a scan with option 2 or 3.")
         return None
     print()
     print("-" * 78)
@@ -1908,6 +1963,15 @@ def ask_resume():
     prov = read_provenance(path)
     if not prov or not prov.get("source"):
         print("That folder has no provenance.json - starting a new recovery.")
+        return None
+    done_total = int(prov.get("source_size") or 0)
+    done_at = int(prov.get("resume_offset") or 0)
+    if prov.get("status") == "complete" and done_at and (not done_total or done_at >= done_total):
+        print()
+        print("That recovery is already complete: %s of %s were scanned."
+              % (fmt_bytes(done_at), fmt_bytes(done_total) if done_total else "the source"))
+        print("Nothing is left to continue there. Start a new scan (option 2 or 3)")
+        print("if you want to search the source again, with other signatures.")
         return None
     prov["recovered_dir"] = path
     remember_path("recovered", os.path.dirname(path))
@@ -1999,6 +2063,423 @@ def run_progressive(target, total, patterns, case_sensitive, recovered_dir,
 
 
 # ----------------------------------------------------------------------
+# fast scan (V5 Sections 5 and 9) and the pre-scan summary (Section 10)
+# ----------------------------------------------------------------------
+
+FAST_SCAN_PREFIX = "fastscan_"
+
+
+def source_kind(target):
+    """'device' for a raw Windows device, 'image' for a file."""
+    return "device" if (IS_WINDOWS and str(target).startswith("\\\\.\\")) else "image"
+
+
+def fast_scan_ranges(total, percent=None):
+    """
+    Section 5: the byte ranges a fast scan reads - the first `percent` and the
+    last `percent` of the source. A source small enough for the two ranges to
+    touch is read once, in full.
+    """
+    percent = FAST_SCAN_PERCENT if percent is None else float(percent)
+    if not total:
+        return [(0, None)]
+    span = int(total * percent / 100.0)
+    span = max(1, min(span, total))
+    tail_start = total - span
+    if tail_start <= span:
+        return [(0, total)]
+    return [(0, span), (tail_start, total)]
+
+
+def _speed_path():
+    return os.path.join(SCRIPT_DIR, SPEED_FILE)
+
+
+def load_speed_rates():
+    """{'device': bytes/s, 'image': bytes/s} - throughput measured here."""
+    try:
+        with open(_speed_path(), "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    rates = {}
+    for key, value in data.items():
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            rates[key] = value
+    return rates
+
+
+def remember_speed(kind, rate):
+    """Best-effort: store the throughput of this run (bytes/s) for `kind`."""
+    try:
+        rate = float(rate)
+    except (TypeError, ValueError):
+        return
+    if rate <= 0:
+        return
+    db = load_speed_rates()
+    db[kind] = round(rate, 1)
+    try:
+        with open(_speed_path(), "w", encoding="utf-8") as fh:
+            json.dump(db, fh, indent=2)
+    except OSError:
+        pass
+
+
+def estimate_scan_seconds(nbytes, target, rates=None):
+    """
+    (seconds, measured) for reading `nbytes` of `target`. `measured` is False
+    when no run has been timed on this machine yet and DEFAULT_SCAN_RATE is
+    used - the pre-scan summary says which one it is instead of pretending.
+    """
+    if not nbytes:
+        return 0.0, False
+    rates = load_speed_rates() if rates is None else rates
+    rate = rates.get(source_kind(target))
+    if not rate:
+        return float(nbytes) / float(DEFAULT_SCAN_RATE), False
+    return float(nbytes) / float(rate), True
+
+
+def print_plan_summary(mode, target, total, patterns, case_sensitive,
+                       coverage_bytes=None, budget=None, extra=()):
+    """
+    Section 10: one screen with the mode, the source, how much will be read and
+    how long it should take - the confirmation that used to be a bare Y/N.
+    """
+    print("=" * 78)
+    print("PLAN FOR THIS RUN")
+    print("=" * 78)
+    print("  mode        : %s" % mode)
+    print("  source      : %s" % target)
+    if total:
+        print("  source size : %s (%s bytes)" % (fmt_bytes(total), fmt_int(total)))
+    else:
+        print("  source size : unknown (reads until end of media)")
+    if coverage_bytes:
+        if total:
+            print("  will read   : %s (%.1f%% of the source)"
+                  % (fmt_bytes(coverage_bytes), 100.0 * coverage_bytes / total))
+        else:
+            print("  will read   : %s" % fmt_bytes(coverage_bytes))
+    print("  signatures  : %d patterns" % len(patterns))
+    print("  case        : %s" % ("sensitive (exact match)" if case_sensitive
+                                  else "insensitive (ignore case)"))
+    print("  read block  : %s" % fmt_bytes(CHUNK_SIZE))
+    if coverage_bytes:
+        seconds, measured = estimate_scan_seconds(coverage_bytes, target)
+        print("  est. time   : about %s (%s)"
+              % (fmt_hms(seconds), "measured on this machine" if measured
+                 else "default %.0f MB/s, nothing measured yet"
+                 % (DEFAULT_SCAN_RATE / (1024.0 * 1024.0))))
+    if budget:
+        print("  time budget : %s hard stop, partial results are kept" % fmt_hms(budget))
+    for key, value in extra:
+        print("  %-11s : %s" % (key, value))
+    print()
+    print("Reading is read-only: nothing on the source is modified.")
+    print()
+
+
+def make_fast_scan_dir(base_dir, target, total):
+    """fastscan_<label>_<size>_<stamp>/ for the fast-scan log and report."""
+    tag = run_tag(target, total)
+    path = os.path.join(base_dir, FAST_SCAN_PREFIX + tag)
+    os.makedirs(path, exist_ok=True)
+    return path, tag
+
+
+def fast_sample_names(target, hits, count=None, before=None, after=None):
+    """
+    File-name-like strings from small windows around a sample of the hits: the
+    fast scan saves no carved files (Section 5), so names are read on the fly.
+    """
+    count = FAST_SCAN_SAMPLE_HITS if count is None else max(1, int(count))
+    before = FAST_SCAN_WINDOW_BEFORE if before is None else before
+    after = FAST_SCAN_WINDOW_AFTER if after is None else after
+    if not hits:
+        return []
+    step = max(1, len(hits) // count)
+    found = {}
+    try:
+        f = open(target, "rb", buffering=0)
+    except OSError:
+        return []
+    try:
+        for hit in hits[::step][:count]:
+            start = max(0, hit["offset"] - before)
+            blob = read_window(f, start, hit["offset"] + after)
+            if not blob:
+                continue
+            for text in (blob.decode("latin-1", "ignore"),
+                         blob.decode("utf-16-le", "ignore")):
+                for match in NAME_RE.finditer(text):
+                    found[match.group(0)] = found.get(match.group(0), 0) + 1
+    except OSError:
+        pass
+    finally:
+        f.close()
+    return sorted(found.items(), key=lambda kv: (-kv[1], kv[0]))[:40]
+
+
+def fast_scan_projection(summary, total, sampled_bytes):
+    """
+    Scale the sampled density up to the whole source (Section 5, "estimated
+    total recoverable size"). This is a projection, not a measurement, and
+    CARVE_LIMIT caps each signature exactly as a full scan would.
+    """
+    hits = summary.get("hits") or []
+    if not sampled_bytes or not total:
+        return {"factor": 1.0, "per_label": {}, "projected_hits": len(hits),
+                "projected_bytes": 0.0, "usable": False}
+    factor = float(total) / float(sampled_bytes)
+    per_label = {}
+    for label, count in (summary.get("counts") or {}).items():
+        if count:
+            per_label[label] = count * factor
+    window = CARVE_BEFORE + CARVE_AFTER
+    projected = 0.0
+    for label, estimate in per_label.items():
+        capped = min(estimate, CARVE_LIMIT) if CARVE_LIMIT else estimate
+        projected += capped * window
+    return {"factor": factor, "per_label": per_label,
+            "projected_hits": int(round(len(hits) * factor)),
+            "projected_bytes": projected, "usable": True}
+
+
+def fast_report_lines(summary, sampled_bytes, ranges, projection, names):
+    """The whole fast-scan output, used both on screen and in the report file."""
+    hits = summary.get("hits") or []
+    zero_bytes = summary.get("zero_bytes") or 0
+    zero_pct = (100.0 * zero_bytes / sampled_bytes) if sampled_bytes else 0.0
+    lines = []
+    lines.append("=" * 78)
+    lines.append("FAST SCAN RESULT - QUICK TRIAGE")
+    lines.append("=" * 78)
+    lines.append("  source        : %s" % summary.get("target"))
+    if summary.get("total_size"):
+        lines.append("  source size   : %s" % fmt_bytes(summary["total_size"]))
+    lines.append("  sampled       : %s in %d region(s)"
+                 % (fmt_bytes(sampled_bytes), len(ranges)))
+    for start, end in ranges:
+        lines.append("                  %s - %s"
+                     % (fmt_bytes(start),
+                        fmt_bytes(end) if end is not None else "end of media"))
+    lines.append("  time          : %s%s"
+                 % (fmt_hms(summary.get("elapsed") or 0.0),
+                    "  (BUDGET REACHED - results are partial)"
+                    if summary.get("budget_hit") else ""))
+    lines.append("  hits          : %d" % len(hits))
+    rows = [(label, count) for label, count in (summary.get("counts") or {}).items()
+            if count]
+    if rows:
+        lines.append("  per signature :")
+        for label, count in sorted(rows, key=lambda kv: -kv[1]):
+            lines.append("      %-44s %d" % (_shorten(label, 44), count))
+    else:
+        lines.append("  per signature : none")
+    lines.append("  zero regions  : %.1f%% of the sampled bytes (%s)"
+                 % (zero_pct, fmt_bytes(zero_bytes)))
+    if names:
+        lines.append("  sample names  : %s"
+                     % ", ".join(name for name, _ in names[:10]))
+    if projection.get("usable"):
+        lines.append("")
+        lines.append("  PROJECTION if the rest of the source has the same density:")
+        lines.append("    hits on the whole source : about %d"
+                     % projection["projected_hits"])
+        lines.append("    recoverable data        : about %s (window %s per hit,"
+                     " %s per signature)"
+                     % (fmt_bytes(projection["projected_bytes"]),
+                        fmt_bytes(CARVE_BEFORE + CARVE_AFTER),
+                        CARVE_LIMIT if CARVE_LIMIT else "no limit"))
+    lines.append("")
+    lines.append("-" * 78)
+    if not hits:
+        lines.append("RECOMMENDATION: no signatures found in the sampled regions.")
+        if zero_pct >= 90.0:
+            lines.append("  %.1f%% of the sampled bytes are zeros - that is the pattern of a"
+                         % zero_pct)
+            lines.append("  wiped, encrypted or TRIMmed (SSD) disk. A full scan is the")
+            lines.append("  only way to be sure, but expect little or nothing to recover.")
+        else:
+            lines.append("  The disk may be wiped, encrypted or TRIMmed (SSD), or it may")
+            lines.append("  hold file types whose signatures are not configured here.")
+    elif len(hits) > FAST_SCAN_HIT_THRESHOLD:
+        lines.append("RECOMMENDATION: %d hits in %s of a %s source - run a FULL SCAN"
+                     % (len(hits), fmt_bytes(sampled_bytes),
+                        fmt_bytes(summary.get("total_size") or 0)))
+        lines.append("  (main menu option 2) to recover everything.")
+    else:
+        lines.append("RECOMMENDATION: %d hits is under the fast-scan threshold (%d), but"
+                     % (len(hits), FAST_SCAN_HIT_THRESHOLD))
+        lines.append("  data is there - run a FULL SCAN (menu option 2) to recover it.")
+    lines.append("-" * 78)
+    return lines
+
+
+def run_fast_scan(target, total, patterns, case_sensitive, budget=None,
+                  percent=None, base_dir=None):
+    """
+    Section 5: read the first and last `percent` of the source inside a hard
+    time budget, then report counts, sample names and a projection. No carved
+    files are written - being fast is the point.
+    Returns the combined summary plus "sampled_bytes", "ranges", "fast_dir",
+    "names", "projection" and "report_path".
+    """
+    budget = FAST_SCAN_BUDGET if budget is None else budget
+    percent = FAST_SCAN_PERCENT if percent is None else percent
+    base_dir = base_dir or SCRIPT_DIR
+    fast_dir, _tag = make_fast_scan_dir(base_dir, target, total)
+    results_path = os.path.join(fast_dir, RESULTS_FILE)
+    ranges = fast_scan_ranges(total, percent)
+    started = time.time()
+    deadline = (started + budget) if budget else None
+
+    summary = {"target": target, "total_size": total, "hits": [],
+               "counts": dict((p[0], 0) for p in patterns),
+               "carved_files": 0, "bytes_scanned": 0, "zero_bytes": 0,
+               "elapsed": 0.0, "interrupted": False, "budget_hit": False,
+               "results_path": results_path, "carve_dir": None}
+
+    for index, (start, end) in enumerate(ranges, 1):
+        if deadline is not None and time.time() >= deadline:
+            summary["budget_hit"] = True
+            break
+        print()
+        print("=" * 78)
+        print("FAST SCAN - region %d of %d : %s - %s"
+              % (index, len(ranges), fmt_bytes(start),
+                 fmt_bytes(end) if end is not None else "end of media"))
+        print("=" * 78)
+        part = scan(target, patterns, CHUNK_SIZE, results_path, None,
+                    FAST_SCAN_WINDOW_BEFORE, FAST_SCAN_WINDOW_AFTER,
+                    show_progress=True, min_gap=MIN_GAP, carve_limit=0,
+                    start_offset=start, end_offset=end, deadline=deadline)
+        merge_summaries(summary, part)
+        summary["budget_hit"] = bool(part.get("budget_hit"))
+        if summary["budget_hit"]:
+            break
+
+    summary["elapsed"] = time.time() - started
+    sampled = summary.get("bytes_scanned") or 0
+    summary["sampled_bytes"] = sampled
+    summary["ranges"] = ranges
+    summary["fast_dir"] = fast_dir
+    summary["names"] = fast_sample_names(target, summary["hits"])
+    summary["projection"] = fast_scan_projection(summary, total, sampled)
+
+    lines = fast_report_lines(summary, sampled, ranges, summary["projection"],
+                              summary["names"])
+    print()
+    print("\n".join(lines))
+
+    report_path = os.path.join(fast_dir, FAST_SCAN_REPORT)
+    try:
+        with open(report_path, "w", encoding="utf-8") as fh:
+            fh.write("FAST SCAN REPORT - %s\n"
+                     % datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+            fh.write("\n".join(lines) + "\n")
+    except OSError:
+        report_path = ""
+    summary["report_path"] = report_path
+
+    prov = provenance_payload(target, total, summary, patterns, case_sensitive,
+                              datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    prov.update({"mode": "fast scan",
+                 "sampled_bytes": sampled,
+                 "ranges": [[start, end] for start, end in ranges],
+                 "fast_scan_dir": fast_dir,
+                 "report": report_path,
+                 "budget_seconds": budget,
+                 "status": "partial (budget)" if summary["budget_hit"] else "complete"})
+    write_provenance(fast_dir, prov)
+    return summary
+
+
+def run_fast_flow(target, total):
+    """Menu option 1: the whole fast-scan conversation (Section 9)."""
+    print()
+    print("Selected target : %s" % target)
+    if total:
+        print("Size            : %s (%s bytes, %s sectors)"
+              % (fmt_bytes(total), fmt_int(total), fmt_int(total // SECTOR_SIZE)))
+    else:
+        print("Size            : unknown (will read until end of media)")
+    print()
+    print("A fast scan reads two small strategic slices of the source - the")
+    print("beginning (partition table, boot sector, often the MFT) and the end")
+    print("(backup structures, recently deleted data) - and tells you in minutes")
+    print("whether a full scan is worth the hours. Nothing is written to the")
+    print("source, and no recovered files are saved: this is a triage pass.")
+    print()
+    try:
+        patterns = build_patterns(CASE_SENSITIVE)
+    except ValueError as exc:
+        print("CONFIG ERROR: %s" % exc)
+        sys.exit(2)
+    if not patterns:
+        print("CONFIG ERROR: no signatures are configured - nothing to search for.")
+        sys.exit(2)
+
+    ranges = fast_scan_ranges(total, FAST_SCAN_PERCENT)
+    coverage = sum((end - start) for start, end in ranges if end is not None)
+    if not total:
+        coverage = 0
+    print_plan_summary(
+        "FAST SCAN - quick triage of the first and last %g%%" % FAST_SCAN_PERCENT,
+        target, total, patterns, CASE_SENSITIVE,
+        coverage_bytes=coverage, budget=FAST_SCAN_BUDGET,
+        extra=(("regions", "%d (%s)" % (len(ranges),
+                                        "first + last" if len(ranges) > 1 else "whole source")),
+               ("carving", "off - summary only, no files saved")))
+    if not confirm_start():
+        print("Stopped. Nothing was scanned.")
+        sys.exit(0)
+
+    print()
+    print("=" * 78)
+    print("SCANNING (hard stop after %s)" % fmt_hms(FAST_SCAN_BUDGET))
+    print("=" * 78)
+    print("Press Ctrl+C to stop early - everything found so far is kept.")
+    print("-" * 78)
+    try:
+        summary = run_fast_scan(target, total, patterns, CASE_SENSITIVE)
+    except PermissionError:
+        print("\nERROR: access denied.")
+        print("Raw device reads require administrator / SYSTEM rights.")
+        print("Re-open the command prompt as Administrator and retry.")
+        sys.exit(3)
+    except OSError as exc:
+        print("\nERROR: %s" % exc)
+        sys.exit(1)
+
+    try:
+        if summary.get("sampled_bytes") and summary.get("elapsed"):
+            remember_speed(source_kind(target),
+                           summary["sampled_bytes"] / max(0.001, summary["elapsed"]))
+    except Exception:
+        pass
+
+    print()
+    print("fast scan folder : %s" % summary["fast_dir"])
+    if summary.get("report_path"):
+        print("  report         : %s" % summary["report_path"])
+        print("  hits log       : %s" % summary["results_path"])
+        print("  provenance     : %s"
+              % os.path.join(summary["fast_dir"], PROVENANCE_FILE))
+    print()
+    print("Carved files are NOT produced by a fast scan. If the recommendation")
+    print("says so, choose option 2 (FULL SCAN) or option 3 (PROGRESSIVE SCAN).")
+
+
+# ----------------------------------------------------------------------
 # main
 # ----------------------------------------------------------------------
 
@@ -2056,8 +2537,9 @@ def ask_target():
         return target, size
 
 
-def run_search_flow(target, total):
-    """Menu options 1 and 3: choose signatures, confirm, scan, report, save."""
+def run_search_flow(target, total, mode="full"):
+    """Menu options 2, 3 and 5: choose signatures, confirm, scan, report, save."""
+    progressive_mode = (mode == "progressive")
     print()
     print("Selected target : %s" % target)
     if total:
@@ -2094,22 +2576,28 @@ def run_search_flow(target, total):
     print("=" * 78)
     print("STEP 4 of 5 - CONFIRM YOUR CHOICES")
     print("=" * 78)
-    print("  target      : %s (%s)" % (target, fmt_bytes(total) if total else "size unknown"))
     print("  extensions  : %s" % ", ".join("." + e for e in sorted(exts)))
-    print("  signatures  : %d patterns will be searched" % len(patterns))
-    print("  case        : %s" % ("sensitive (exact match)" if case_sensitive else "insensitive (ignore case)"))
-    print("  read block  : %s" % fmt_bytes(CHUNK_SIZE))
     print()
-    print("Scanning is read-only: nothing on the disk is modified.")
-    print("Recovered data is collected in : %s" % SCRIPT_DIR)
-    print("After the scan you will be asked where to save it permanently.")
-    print()
+    if progressive_mode:
+        plan_mode = "PROGRESSIVE SCAN - %d%% slices, a checkpoint after each one" % PROGRESSIVE_PERCENT
+    else:
+        plan_mode = "FULL SCAN - one complete pass over the source"
+    print_plan_summary(plan_mode, target, total, patterns, case_sensitive,
+                       coverage_bytes=total or None,
+                       extra=(("recovered", "collected in %s, saved where you choose after the scan"
+                               % SCRIPT_DIR),))
     if not confirm_start():
         print("Stopped. Nothing was scanned.")
         sys.exit(0)
 
-    slice_answer, slice_ok = _ask("Scan in 5%% slices with a checkpoint after each? [y/N]: ")
-    progressive = slice_ok and slice_answer.strip().lower() in ("y", "yes")
+    if progressive_mode:
+        progressive = True
+        print()
+        print("This run scans in %d%% slices with a checkpoint after each one."
+              % PROGRESSIVE_PERCENT)
+    else:
+        slice_answer, slice_ok = _ask("Scan in 5%% slices with a checkpoint after each? [y/N]: ")
+        progressive = slice_ok and slice_answer.strip().lower() in ("y", "yes")
 
     # ---------------- STEP 5 ----------------
     print()
@@ -2151,6 +2639,15 @@ def run_search_flow(target, total):
         print("\nERROR: %s" % exc)
         sys.exit(1)
 
+    # remember the throughput of this run: the pre-scan time estimate for the
+    # next scan is built from it (Section 10)
+    try:
+        if summary.get("bytes_scanned") and summary.get("elapsed"):
+            remember_speed(source_kind(target),
+                           summary["bytes_scanned"] / max(0.001, summary["elapsed"]))
+    except Exception:
+        pass
+
     # ---------------- RESULTS ----------------
     print()
     print("=" * 78)
@@ -2170,6 +2667,9 @@ def run_search_flow(target, total):
     provenance["recovered_dir"] = recovered_dir
     provenance["organized_dir"] = organized_dir
     provenance["results_log"] = results_path
+    # a finished full scan has no resume point: say where it ended, so the
+    # resume list shows 100% and refuses to redo it (Section 3)
+    provenance["resume_offset"] = int(summary.get("bytes_scanned") or total or 0)
     write_provenance(recovered_dir, provenance)
 
     # organized browsable output (Section 2)
@@ -2505,7 +3005,7 @@ def create_disk_image(source, dest, chunk_size, show_progress=True, mode="raw"):
         f.close()
 
 def run_imaging_flow():
-    """Menu option 2: create a full image of a disk in one fast read."""
+    """Menu option 4: create a full image of a disk in one fast read."""
     print("=" * 78)
     print("STEP 1 of 5 - CHOOSE THE DISK TO IMAGE")
     print("=" * 78)
@@ -2617,8 +3117,86 @@ def run_imaging_flow():
     print("  info file    : %s" % (summary["dest"] + ".info.txt"))
     if not summary["interrupted"]:
         print()
-        print("Next step: run this tool again and choose option 3 to analyze the")
+        print("Next step: run this tool again and choose option 5 to analyze the")
         print("image - the original disk will not be touched again.")
+
+
+def resume_flow(resumed):
+    """Section 3: continue a previous recovery, in place (menu option 6)."""
+    resume_target, resume_prov, resume_offset = resumed
+    resume_total = int(resume_prov.get("source_size") or 0)
+    labels = set(resume_prov.get("signature_labels") or [])
+    resume_case = bool(resume_prov.get("case_sensitive", True))
+    resume_patterns = [p for p in build_patterns(resume_case)
+                       if not labels or p[0] in labels]
+    recovered_dir = resume_prov.get("recovered_dir") or ""
+    organized_dir = resume_prov.get("organized_dir") or ""
+    if not organized_dir or not os.path.isdir(organized_dir):
+        organized_dir = os.path.join(
+            os.path.dirname(recovered_dir),
+            os.path.basename(recovered_dir).replace(RECOVERED_PREFIX,
+                                                    ORGANIZED_PREFIX, 1))
+        os.makedirs(organized_dir, exist_ok=True)
+    print()
+    print("Continuing %s from %s with %d signatures"
+          % (resume_target, fmt_bytes(resume_offset), len(resume_patterns)))
+    combined = run_progressive(resume_target, resume_total, resume_patterns,
+                               resume_case, recovered_dir, organized_dir,
+                               resume_prov.get("started") or "",
+                               resume_from=resume_offset,
+                               tag=resume_prov.get("run_id", ""))
+    print()
+    print("Recovery updated: %d hits, %d files carved, resume offset %s"
+          % (len(combined["hits"]), combined["carved_files"],
+             fmt_bytes(combined["resume_offset"])))
+    print("  recovered : %s" % recovered_dir)
+    print("  organized : %s" % organized_dir)
+
+
+def choose_source(image_only=False):
+    """
+    Ask whether the scan reads a physical disk or an existing image, then return
+    (target, size). Everything is picked from a list - nothing is typed.
+    """
+    if not image_only:
+        print("=" * 78)
+        print("STEP 1 of 5 - CHOOSE WHAT TO SCAN")
+        print("=" * 78)
+        print("  [1] A PHYSICAL DISK      - read raw and read-only (needs Administrator)")
+        print("  [2] AN EXISTING IMAGE    - an .img created earlier, or any image file")
+        print()
+        answer, ok = _ask("Your choice [1]: ")
+        if not ok:
+            return None, 0
+        if answer.strip() == "2":
+            image_only = True
+        print()
+    if image_only:
+        print("=" * 78)
+        print("STEP 1 of 5 - CHOOSE THE DISK IMAGE")
+        print("=" * 78)
+        print("Pick the image from the list below, or browse to its folder.")
+        print("Analyzing an image does not touch the original disk at all.")
+        print()
+        return ask_image_file()
+    print("=" * 78)
+    print("STEP 1 of 5 - CHOOSE THE DISK TO SCAN")
+    print("=" * 78)
+    if TARGET.strip():
+        target = TARGET.strip()
+        print("Using the disk fixed in TARGET at the bottom of this script.")
+        try:
+            return target, open_target(target)
+        except PermissionError:
+            print("ERROR: access denied opening %s - run as Administrator." % target)
+            sys.exit(3)
+        except OSError as exc:
+            print("ERROR: %s" % exc)
+            sys.exit(1)
+    print("The machine may contain several disks. Every disk is listed below with")
+    print("its exact size and sector count so you can identify the right one.")
+    print()
+    return ask_target()
 
 
 def main():
@@ -2631,101 +3209,79 @@ def main():
     print()
     resumed = ask_resume()
     if resumed:
-        resume_target, resume_prov, resume_offset = resumed
-        resume_total = int(resume_prov.get("source_size") or 0)
-        labels = set(resume_prov.get("signature_labels") or [])
-        resume_case = bool(resume_prov.get("case_sensitive", True))
-        resume_patterns = [p for p in build_patterns(resume_case)
-                           if not labels or p[0] in labels]
-        recovered_dir = resume_prov.get("recovered_dir") or ""
-        organized_dir = resume_prov.get("organized_dir") or ""
-        if not organized_dir or not os.path.isdir(organized_dir):
-            organized_dir = os.path.join(
-                os.path.dirname(recovered_dir),
-                os.path.basename(recovered_dir).replace(RECOVERED_PREFIX,
-                                                        ORGANIZED_PREFIX, 1))
-            os.makedirs(organized_dir, exist_ok=True)
-        print()
-        print("Continuing %s from %s with %d signatures"
-              % (resume_target, fmt_bytes(resume_offset), len(resume_patterns)))
-        combined = run_progressive(resume_target, resume_total, resume_patterns,
-                                   resume_case, recovered_dir, organized_dir,
-                                   resume_prov.get("started") or "",
-                                   resume_from=resume_offset,
-                                   tag=resume_prov.get("run_id", ""))
-        print()
-        print("Recovery updated: %d hits, %d files carved, resume offset %s"
-              % (len(combined["hits"]), combined["carved_files"],
-                 fmt_bytes(combined["resume_offset"])))
-        print("  recovered : %s" % recovered_dir)
-        print("  organized : %s" % organized_dir)
+        resume_flow(resumed)
         return
 
     print("=" * 78)
     print("MAIN MENU - CHOOSE WHAT TO DO")
     print("=" * 78)
-    print("  1 - SEARCH A DISK FOR FILE SIGNATURES")
-    print("      Reads a disk once and reports every match right away.")
+    print("  1 - FAST SCAN (quick triage)")
+    print("      Reads only the first 5% and the last 5% of the source, inside a")
+    print("      5 minute budget, and tells you whether a full scan is worth it.")
+    print("      Saves no files: it is an assessment, not a recovery.")
     print()
-    print("  2 - CREATE A FULL IMAGE OF A DISK  (recommended first step)")
-    print("      Copies every byte of the disk into one .img file in a single")
-    print("      fast pass. The disk hardware is read only once; the image can")
-    print("      then be analyzed again and again without stressing the disk.")
+    print("  2 - FULL SCAN (complete pass)")
+    print("      Reads the whole source once and carves every hit. Slow, but it")
+    print("      leaves nothing behind.")
     print()
-    print("  3 - ANALYZE AN EXISTING DISK IMAGE")
-    print("      Searches an image file (created by option 2, or any .img)")
-    print("      for file signatures and recovers data from it.")
+    print("  3 - PROGRESSIVE SCAN (chunked, 5% at a time)")
+    print("      The same scan, stopped after every 5% with a checkpoint, so it")
+    print("      can be continued later (option 6) without starting over.")
     print()
-    print("Best practice: run option 2 first, then option 3 on the created image.")
+    print("  4 - CREATE DISK IMAGE  (recommended before scanning a real disk)")
+    print("      Copies every byte of the disk into one .img file. The disk is")
+    print("      read once; the image can then be scanned again and again.")
+    print()
+    print("  5 - ANALYZE EXISTING IMAGE")
+    print("      Searches an image file (created by option 4, or any .img) for")
+    print("      signatures and recovers data from it.")
+    print()
+    print("  6 - RESUME PREVIOUS RECOVERY")
+    print("      Continues any recovered_* folder from the offset it stopped at,")
+    print("      in place, with its own signatures - nothing is rescanned.")
+    print()
+    print("Best practice: option 4 once on the damaged disk, then option 5 on")
+    print("the image, then option 2 on the image if it promises data.")
     print()
     while True:
         try:
-            choice = input("Your choice [1/2/3]: ").strip()
+            choice = input("Your choice [1-6]: ").strip()
         except (EOFError, KeyboardInterrupt):
             print()
             print("No choice made. Nothing was done.")
             sys.exit(0)
-        if choice in ("1", "2", "3"):
+        if choice in ("1", "2", "3", "4", "5", "6"):
             break
-        print("Please type 1, 2 or 3.")
+        print("Please type a number from 1 to 6.")
     print()
-    if choice == "2":
+
+    if choice == "4":
         run_imaging_flow()
         return
-    if choice == "3":
-        print("=" * 78)
-        print("STEP 1 of 5 - CHOOSE THE DISK IMAGE TO ANALYZE")
-        print("=" * 78)
-        print("Type the path of the image file created by option 2 (a .img file).")
-        print("Analyzing an image does not touch the original disk at all.")
-        print()
-        target, total = ask_image_file()
+    if choice == "6":
+        resumed = ask_resume(force=True)
+        if not resumed:
+            return
+        resume_flow(resumed)
+        return
+    if choice == "5":
+        target, total = choose_source(image_only=True)
         if not target:
             print("No image selected. Nothing was scanned.")
             sys.exit(0)
+        run_search_flow(target, total, mode="full")
+        return
+
+    target, total = choose_source()
+    if not target:
+        print("No target selected. Nothing was scanned.")
+        sys.exit(0)
+    if choice == "1":
+        run_fast_flow(target, total)
+    elif choice == "3":
+        run_search_flow(target, total, mode="progressive")
     else:
-        print("=" * 78)
-        print("STEP 1 of 5 - CHOOSE THE DISK TO SCAN")
-        print("=" * 78)
-        print("The machine may contain several disks. Every disk is listed below with")
-        print("its exact size and sector count so you can identify the right one.")
-        print()
-        if TARGET.strip():
-            target = TARGET.strip()
-            try:
-                total = open_target(target)
-            except PermissionError:
-                print("ERROR: access denied opening %s - run as Administrator." % target)
-                sys.exit(3)
-            except OSError as exc:
-                print("ERROR: %s" % exc)
-                sys.exit(1)
-        else:
-            target, total = ask_target()
-            if not target:
-                print("No target selected. Nothing was scanned.")
-                sys.exit(0)
-    run_search_flow(target, total)
+        run_search_flow(target, total, mode="full")
 
 
 # ======================================================================
@@ -2743,7 +3299,7 @@ TARGET = ""
 # (512 / 4096 / 8 MiB style sizes are all fine as long as they are).
 CHUNK_SIZE = 8 * 1024 * 1024
 
-# Read block size for imaging (menu option 2). The disk is read once, so big
+# Read block size for imaging (menu option 4). The disk is read once, so big
 # blocks maximize sustained throughput. Must be a multiple of 4096 for raw
 # devices.
 IMAGE_CHUNK_SIZE = 8 * 1024 * 1024
@@ -2782,6 +3338,28 @@ CARVE_BLOCK_SIZE = 4 * 1024 * 1024
 # 1 = always sequential. Small sources stay sequential.
 PARALLEL_WORKERS = None
 PARALLEL_MIN_SIZE = 64 * 1024 * 1024
+
+# ---- fast scan (V5 Section 5, menu option 1) --------------------------------
+# Coverage: the first FAST_SCAN_PERCENT and the last FAST_SCAN_PERCENT of the
+# source. FAST_SCAN_BUDGET is a hard wall-clock stop: the scan returns what it
+# has, marks the run partial and says so in the report.
+FAST_SCAN_PERCENT = 5.0
+FAST_SCAN_BUDGET = 5 * 60
+# Carve window used by the fast scan. It saves no files, these only bound the
+# windows read to pick sample file names (2 KB before / 16 KB after).
+FAST_SCAN_WINDOW_BEFORE = 2 * 1024
+FAST_SCAN_WINDOW_AFTER = 16 * 1024
+# Above this many hits in the sampled regions the report recommends a full scan.
+FAST_SCAN_HIT_THRESHOLD = 50
+# How many hit windows are read to show sample file names.
+FAST_SCAN_SAMPLE_HITS = 20
+FAST_SCAN_REPORT = "fast_scan_report.txt"
+
+# Throughput memory for the pre-scan time estimate (Section 10). The last
+# measured run on THIS machine is stored here; with no measurement the estimate
+# uses DEFAULT_SCAN_RATE and says so on screen instead of pretending.
+SPEED_FILE = "scan_speed.json"
+DEFAULT_SCAN_RATE = 60 * 1024 * 1024
 
 # Magic-byte signatures: label -> hex bytes (or bytes). Binary formats with a
 # fixed, well-known header. Add more whenever you need them.
