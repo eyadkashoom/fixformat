@@ -15,6 +15,7 @@ Checks:
 
 import hashlib
 import inspect
+import json
 import os
 import shutil
 import sys
@@ -423,6 +424,83 @@ def main():
         if needle not in menu_src:
             failures.append("main menu is missing %r" % needle)
 
+    # v5 step 6: signature profiles (Section 7). Hex is spaces-between-bytes,
+    # a bare token is TEXT (AutoCAD's header really is the text "AC10").
+    prof = raw_scan.parse_signature_profile(
+        {"name": "AutoCAD only", "signatures": {"dwg": ["AC10"], ".pdf": ["25 50 44 46 2D"]}})
+    if set(prof) != {"dwg", "pdf"}:
+        failures.append("profile extensions = %r" % sorted(prof))
+    ppats = raw_scan.profile_patterns(prof, True)
+    pdf_pats = [entry for entry in ppats if entry[2] == "pdf"]
+    dwg_pats = [entry for entry in ppats if entry[2] == "dwg"]
+    if not pdf_pats or pdf_pats[0][1] != b"%PDF-":
+        failures.append("hex profile value did not decode: %r" % (pdf_pats[:1],))
+    if not any(b"AC10" in entry[1] for entry in dwg_pats):
+        failures.append("text profile value missing: %r" % (dwg_pats[:2],))
+    if len(dwg_pats) < 2:
+        failures.append("text profile value searched in %d encoding(s)" % len(dwg_pats))
+    for bad_profile in ({}, {"signatures": {}}, {"signatures": {"md": []}},
+                        {"signatures": {"m d": ["x"]}}, {"signatures": {"md": [""]}}, []):
+        try:
+            raw_scan.parse_signature_profile(bad_profile)
+            failures.append("profile accepted invalid input: %r" % (bad_profile,))
+        except ValueError as exc:
+            if not str(exc):
+                failures.append("profile error had no message for %r" % (bad_profile,))
+
+    prof_path = os.path.join(tmpdir, "profile.json")
+    with open(prof_path, "w", encoding="utf-8") as fh:
+        json.dump({"name": "test profile",
+                   "signatures": {"md": [".md"], "pdf": ["25 50 44 46 2D"]}}, fh)
+    loaded, loaded_name = raw_scan.load_signature_profile(prof_path)
+    if set(loaded) != {"md", "pdf"} or loaded_name != "test profile":
+        failures.append("load_signature_profile = %r %r" % (loaded, loaded_name))
+    bad_path = os.path.join(tmpdir, "bad_profile.json")
+    with open(bad_path, "w", encoding="utf-8") as fh:
+        fh.write("{not json")
+    try:
+        raw_scan.load_signature_profile(bad_path)
+        failures.append("invalid JSON profile was accepted")
+    except ValueError as exc:
+        if os.path.basename(bad_path) not in str(exc):
+            failures.append("JSON error does not name the file: %s" % exc)
+
+    # a scan driven by a profile reports only the profile's patterns
+    prof_scan = raw_scan.scan(img, raw_scan.profile_patterns(loaded, True), CHUNK,
+                              os.path.join(tmpdir, "profile_results.txt"), None,
+                              show_progress=False, min_gap=0)
+    prof_labels = set(entry["label"] for entry in prof_scan["hits"])
+    if not prof_labels:
+        failures.append("a profile scan found nothing")
+    elif any(not label.startswith("Profile .md") for label in prof_labels):
+        failures.append("profile scan reported a label outside the profile: %r"
+                        % sorted(prof_labels))
+
+    # v5 step 6: output root validation (Section 8)
+    good_root = os.path.join(tmpdir, "out_root")
+    usable, where = raw_scan.validate_output_root(good_root)
+    if not usable or os.path.abspath(where) != os.path.abspath(good_root):
+        failures.append("validate_output_root rejected a temp folder: %r" % (where,))
+    usable, reason = raw_scan.validate_output_root(os.path.join(img, "sub"))
+    if usable or not reason:
+        failures.append("validate_output_root accepted a path inside a file")
+    if raw_scan.validate_output_root("     ")[0]:
+        failures.append("validate_output_root accepted an empty path")
+
+    bs = chr(92)                                    # no escape traps: build paths
+    unc = bs + bs + "server" + bs + "share"
+    dev_path = bs + bs + "." + bs + "D:"
+    if not raw_scan.is_network_path(unc):
+        failures.append("is_network_path missed a UNC path")
+    if raw_scan.is_network_path("C:" + bs + "local"):
+        failures.append("is_network_path called a local path a share")
+    if not raw_scan.same_local_volume(dev_path, "D:" + bs + "out"):
+        failures.append("same_local_volume missed D: on the same volume")
+    if raw_scan.same_local_volume(dev_path, unc):
+        failures.append("same_local_volume called a share local")
+    if raw_scan.same_local_volume(dev_path, "C:" + bs + "out"):
+        failures.append("same_local_volume matched the wrong drive letter")
+
     # results log must contain every reported hit
     with open(results, "r", encoding="utf-8") as fh:
         log_text = fh.read()
@@ -445,6 +523,8 @@ def main():
     print("image picker discovery/depth/partial flags and remembered paths verified.")
     print("fast scan verified: 5%+5% regions, budget stop, no carving, report+projection,")
     print("speed memory for the time estimate and the six-item main menu.")
+    print("step 6 verified: JSON signature profiles (parse/load/refusals/profile scan),")
+    print("output-root validation, UNC detection and the same-volume warning trigger.")
     shutil.rmtree(tmpdir, ignore_errors=True)
     sys.exit(0)
 

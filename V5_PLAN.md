@@ -479,17 +479,17 @@ and mmap (13.6) only pays on repeated scans of the same image.
 | 4 | **done** | **Sections 1 + 2**: `recovered_<label>_<size>_<stamp>/` + `provenance.json`, `organized_*/by_extension/<ext>/` + `index.html` + `summary.txt`, and `scan(start_offset, end_offset)` with bounded reads (a full scan split into two halves yields exactly the full-scan hits, A=4564 B=5032 of 9128 bytes). **Sections 3 + 4**: `run_progressive()` (5% slices, checkpoint + `resume_offset`/`status` after each one) and `ask_resume()` (numbered list of `recovered_*` folders or a typed path, signatures rebuilt from provenance). Verified: stop after slice 1 -> `interrupted` at 1 MB, resume -> `complete` at 3.89 MB, stitched hits == full scan (2 == 2). Commit `13d9849` |
 | 5 | **done** | **Sections 5 + 9 + 10.** Fast scan: `fast_scan_ranges()` (first+last 5%, one pass when the two touch), a hard clock budget threaded through `scan(deadline=)`, `parallel_phase1(deadline=)` and the child worker, reduced 2 KB/16 KB windows, no carving at all, on-the-fly sample names, density projection (capped by `CARVE_LIMIT`), zero-region/TRIM reporting and the >50-hit / 0-hit recommendation gate; output is `fastscan_<label>_<size>_<stamp>/` with `fast_scan_report.txt` + `provenance.json`. Six-item menu with a disk-or-image source picker, and a pre-scan `PLAN FOR THIS RUN` block (mode, coverage, signatures, estimated time from the last measured run in `scan_speed.json`). Verified by scripted runs: 100 MB image, parallel on, hits only in the sampled regions (2048 / 104849408 found, 52428800 correctly absent), `sampled_bytes` = 10.00 MB exactly, names from both regions, projection 40 hits / 2.66 MB; exhausted budget -> 0 hits + `budget_hit`; menu options 1/2/3/6 driven end-to-end; `v5/selftest.py` PASS (now covers ranges, budget stop, no-carve, report, projection, speed memory, menu) and `v4/selftest.py` still PASS |
 
+| 6 | **done** | **Sections 7 + 8.** Profile: `parse_signature_profile` / `load_signature_profile` / `profile_patterns` / `profile_summary`, reached from STEP 2 of both the full and the fast scan through a numbered `.json` picker; hex is spaces-between-bytes and a bare token is TEXT (AutoCAD's `AC10` really is text), every malformed entry raises a message that names the key and **stops the run** instead of silently scanning with the built-in set. Output root: `validate_output_root` (creates the folder and proves it writable with a probe file), `ask_output_root` before the plan + `OUTPUT_ROOT` config, `same_local_volume` / `source_drive_letter` for the non-blocking same-disk warning, and a local fallback when the share is unusable. Verified by scripted runs: a `.md`+`.pdf` profile produced `recovered_*` inside the chosen root with 3 profile signatures in `provenance.json` and nothing written next to the script; a broken profile exited 2 with `SIGNATURE ERROR: profile entry .md has no signatures`; an unusable root printed `CANNOT USE THAT FOLDER` and the scan completed next to the script. Selftest covers parse/load/refusals, a profile-driven scan, root validation, UNC detection and the same-volume trigger. Gap kept for step 7/8: a share that disappears **mid-run** is caught by the final move (results stay local), not detected during the scan |
+
 ## Next step
 
-Steps 0-5 are done and committed. **Step 6 is next**: Sections 7 + 8 - JSON
-signature profile loading (`--profile` / a menu choice, ~25 signatures instead of
-81, which is the biggest remaining speed lever) and SMB / network-share output
-for the recovered folders. Then step 7 (mmap for image files + a benchmark on
-real media) and step 8 (same-disk refusal on the destination, tag `v5.0.0`,
-release with `python-embed.zip`, add v5 to CI).
+Steps 0-6 are done and committed. **Step 7 is next**: Section 13.6 mmap for
+image files, then 13.8 - the first measurement on real media instead of a
+synthetic fixture (the only numbers so far are 4.3x on a 256 MB fixture, and
+every fast-scan figure comes from a 100 MB synthetic image).
 
-The full-disk imaging trial on this machine is **not** a prerequisite for v5 -
-the imaging engine was already exercised successfully (raw and gzip, SHA-256
-match) and the user confirmed the feature works. Nothing in v5 has been run on a
-real disk or real image yet: every measurement above is on synthetic media
-(256 MB, 100 MB, 4 MB, 3.89 MB fixtures).
+Then step 8: Section 12's same-physical-disk refusal on the destination (today
+it is a warning, not a refusal), tag `v5.0.0`, the release with
+`python-embed.zip`, and v5 in CI.
+
+Nothing in v5 has ever run against a real disk or a real image file.

@@ -168,6 +168,120 @@ def filter_patterns_by_extension(patterns, extensions):
     return [entry for entry in patterns if entry[2] in extensions]
 
 
+# ----------------------------------------------------------------------
+# signature profiles - a JSON list of magic bytes (v5 Section 7)
+# ----------------------------------------------------------------------
+
+PROFILE_FILE = "signature_profile.json"
+# Hex is written with spaces between bytes: "25 50 44 46 2D". A bare token
+# ("AC10", "25504446") is read as TEXT, which is what AutoCAD's "AC10" header
+# actually is - the tool must not guess.
+HEX_VALUE_RE = re.compile(r"^[0-9A-Fa-f]{2}(?:\s+[0-9A-Fa-f]{2})*$")
+PROFILE_EXT_RE = re.compile(r"^[a-z0-9_+-]{1,16}$")
+
+
+def looks_like_hex(value):
+    """True when every space-separated token of `value` is one hex byte."""
+    text = str(value or "").strip()
+    return bool(text) and bool(HEX_VALUE_RE.match(text))
+
+
+def parse_signature_profile(data):
+    """
+    Validate the Section 7 shape and return {'<ext>': [value, ...]}:
+
+        {"name": "AutoCAD only", "signatures": {"dwg": ["AC10", "AC11"]}}
+
+    Raises ValueError naming the offending entry: a bad profile must fail before
+    a scan starts, with a message that says which key is wrong.
+    """
+    if not isinstance(data, dict):
+        raise ValueError("a profile must be one JSON object")
+    signatures = data.get("signatures")
+    if not isinstance(signatures, dict) or not signatures:
+        raise ValueError("the profile has no 'signatures' object, or it is empty")
+    profile = {}
+    for raw_ext, values in signatures.items():
+        if not isinstance(raw_ext, str) or not raw_ext.strip():
+            raise ValueError("a profile extension key is not text: %r" % (raw_ext,))
+        ext = raw_ext.strip().lstrip(".").lower()
+        if not PROFILE_EXT_RE.match(ext):
+            raise ValueError("profile extension %r is not a plain extension "
+                             "(write .md, .dwg, .pdf ...)" % (raw_ext,))
+        if isinstance(values, str):
+            values = [values]
+        if not isinstance(values, (list, tuple)) or not values:
+            raise ValueError("profile entry .%s has no signatures" % ext)
+        kept = []
+        for value in values:
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError("profile entry .%s has an empty signature" % ext)
+            text = value.strip()
+            if looks_like_hex(text):
+                try:
+                    parse_hex_pattern(text)
+                except ValueError as exc:
+                    raise ValueError("profile entry .%s: %s" % (ext, exc))
+            kept.append(text)
+        profile[ext] = kept
+    if not profile:
+        raise ValueError("the profile is empty")
+    return profile
+
+
+def load_signature_profile(path):
+    """
+    Read + validate a profile file. Returns (profile, name).
+    Every failure is a ValueError with a sentence a user can act on.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError as exc:
+        raise ValueError("cannot read the profile %s: %s" % (path, exc))
+    try:
+        data = json.loads(text)
+    except ValueError as exc:
+        raise ValueError("the profile %s is not valid JSON: %s"
+                         % (os.path.basename(str(path)), exc))
+    profile = parse_signature_profile(data)
+    name = data.get("name") if isinstance(data.get("name"), str) else ""
+    return profile, name.strip()
+
+
+def _profile_preview(value, width=32):
+    flat = " ".join(str(value).split())
+    return flat if len(flat) <= width else flat[:width - 3] + "..."
+
+
+def profile_patterns(profile, case_sensitive=None):
+    """{'ext': [values]} -> (label, pattern_bytes, ext, case_insensitive)."""
+    if case_sensitive is None:
+        case_sensitive = CASE_SENSITIVE
+    patterns = []
+    for ext in sorted(profile):
+        for value in profile[ext]:
+            base = "Profile .%s %s" % (ext, _profile_preview(value))
+            if looks_like_hex(value):
+                patterns.append((base, parse_hex_pattern(value), ext, False))
+            else:
+                for label, pat, entry_ext in expand_text_signature(base, value, ext):
+                    patterns.append((label, pat, entry_ext, not case_sensitive))
+    if not patterns:
+        raise ValueError("the profile produced no usable patterns")
+    return patterns
+
+
+def profile_summary(profile, name=""):
+    """One line for the pre-scan plan: name, extensions, signature count."""
+    parts = []
+    for ext in sorted(profile):
+        parts.append(".%s(%d)" % (ext, len(profile[ext])))
+    label = name or "profile"
+    return "%s: %d signatures over %s" % (label, sum(len(v) for v in profile.values()),
+                                         " ".join(parts))
+
+
 def ask_extensions(patterns):
     """Ask which file extensions to search for. Returns a set like {'md','py'}."""
     exts = available_extensions(patterns)
@@ -199,6 +313,111 @@ def ask_extensions(patterns):
             print("Invalid input. Use numbers from the list (e.g. 1,3,5) or 'all'.")
             continue
         return picked
+
+
+STATE_FILES = ("last_paths.json", "scan_speed.json")
+
+
+def list_profile_files(roots=None, depth=2):
+    """[(path, size)] for the .json files that could be a signature profile."""
+    if roots is None:
+        remembered = load_last_paths().get("profile")
+        roots = [d for d in (SCRIPT_DIR, remembered) if d]
+    found = []
+    seen = set()
+    for root in roots:
+        if not root or not os.path.isdir(root):
+            continue
+        base_depth = os.path.abspath(root).rstrip(os.sep).count(os.sep)
+        for cur, dirs, files in os.walk(root):
+            if os.path.abspath(cur).rstrip(os.sep).count(os.sep) - base_depth >= depth:
+                del dirs[:]
+            for name in sorted(files):
+                if not name.lower().endswith(".json"):
+                    continue
+                if name.lower() in STATE_FILES:
+                    continue
+                path = os.path.join(cur, name)
+                if path.lower() in seen:
+                    continue
+                try:
+                    size = os.path.getsize(path)
+                except OSError:
+                    continue
+                seen.add(path.lower())
+                found.append((path, size))
+    found.sort(key=lambda item: item[0].lower())
+    return found
+
+
+def ask_profile_file():
+    """Numbered picker for a profile. Returns ({ext: [...]}, name) or (None, "")."""
+    candidates = list_profile_files()
+    print()
+    if candidates:
+        print("PROFILE FILES FOUND (%d)" % len(candidates))
+        for index, (path, size) in enumerate(candidates[:PICKER_PAGE], 1):
+            print("  [%d] %-52s %8s" % (index, _shorten(os.path.basename(path), 52),
+                                        fmt_bytes(size)))
+            print("      %s" % _shorten(os.path.dirname(path), 68))
+        print("  [0] Type the full path of another profile")
+    else:
+        print("No .json profile was found next to this script.")
+        print("  [0] Type the full path of a profile")
+    print("  [N] Keep the built-in signatures")
+    answer, ok = _ask("Profile [N]: ")
+    if not ok:
+        return None, ""
+    answer = answer.strip()
+    if not answer or answer.lower() in ("n", "q"):
+        return None, ""
+    path = None
+    if answer == "0" or not answer.isdigit():
+        typed, ok_path = _ask("Profile path: ")
+        if not ok_path:
+            return None, ""
+        typed = typed.strip().strip('"').strip("'")
+        path = os.path.abspath(os.path.expanduser(typed)) if typed else None
+    else:
+        index = int(answer) - 1
+        if 0 <= index < min(len(candidates), PICKER_PAGE):
+            path = candidates[index][0]
+    if not path:
+        print("No profile chosen - keeping the built-in signatures.")
+        return None, ""
+    if not os.path.isfile(path):
+        raise ValueError("no such profile file: %s" % path)
+    profile, name = load_signature_profile(path)   # ValueError explains itself
+    remember_path("profile", path)
+    print()
+    print("Loaded %s" % os.path.basename(path))
+    print("  %s" % profile_summary(profile, name))
+    return profile, name
+
+
+def ask_signature_source():
+    """
+    Section 7: the built-in signatures, or a JSON profile of magic bytes.
+    Returns ("builtin", None, "") or ("profile", {ext: [values]}, name).
+    """
+    print("=" * 78)
+    print("STEP 2 of 5 - CHOOSE THE SIGNATURES")
+    print("=" * 78)
+    print("  [1] BUILT-IN SIGNATURES - every file type this script knows")
+    print("  [2] A JSON PROFILE      - only the bytes you list in a file")
+    print()
+    print("A profile is the fast path: every block is compared against a handful")
+    print("of patterns instead of all of them, and only what you asked for is")
+    print("reported. Hex bytes are written with spaces (25 50 44 46 2D); anything")
+    print("else is searched as text in the configured encodings.")
+    print()
+    answer, ok = _ask("Your choice [1]: ")
+    if not ok or answer.strip() not in ("2",):
+        return "builtin", None, ""
+    profile, name = ask_profile_file()
+    if profile is None:
+        return "builtin", None, ""
+    return "profile", profile, name
 
 
 def ask_case_sensitive():
@@ -1615,15 +1834,143 @@ def print_report(summary, names):
         print("  (none found)")
 
 
-def ask_save_location(work_dir):
+PROBE_NAME = ".fixformat_write_test"
+
+
+def is_network_path(path):
+    """True for \\\\server\\share and //server/share."""
+    text = str(path or "")
+    return text.startswith("\\\\") or text.startswith("//")
+
+
+def path_drive_letter(path):
+    """'D:\\x' -> 'd'; a UNC share or anything else -> ''."""
+    m = re.match(r"^([A-Za-z]):[\\/]", str(path or ""))
+    return m.group(1).lower() if m else ""
+
+
+def source_drive_letter(target):
+    """The drive behind a scan target: a device path -> 'd'; a plain file path -> 'd'."""
+    text = str(target or "")
+    bs = chr(92)                      # built from a constant: no escaping traps
+    device = bs + bs + "." + bs       # the Windows device namespace
+    if text.startswith(device) and len(text) > len(device) + 1:
+        letter = text[len(device)]
+        if letter.isalpha() and text[len(device) + 1] == ":":
+            return letter.lower()   # \\.\D: is a volume; \\.\PhysicalDrive0 is not
+    return path_drive_letter(text)
+
+
+def same_local_volume(target, path):
+    """True when `path` is on the same drive letter as a volume target."""
+    src = source_drive_letter(target)
+    dst = path_drive_letter(path)
+    return bool(src and dst and src == dst)
+
+
+def validate_output_root(path):
     """
-    Ask whether the two run folders should be moved to another disk.
+    Section 8: can recovered data be written to `path`?
+    Returns (ok, message) - the message is the resolved path when ok, otherwise
+    the reason. Creates the folder and proves it is writable with a probe file,
+    so an unreachable share is refused BEFORE the scan instead of after hours.
+    """
+    text = str(path or "").strip().strip('"').strip("'")
+    if not text:
+        return False, "no output folder was given"
+    root = os.path.expanduser(text)
+    if not is_network_path(root):
+        root = os.path.abspath(root)
+    if os.path.exists(root) and not os.path.isdir(root):
+        return False, "%s exists and is a file, not a folder" % root
+    try:
+        os.makedirs(root, exist_ok=True)
+    except OSError as exc:
+        return False, "cannot create %s: %s" % (root, exc)
+    probe = os.path.join(root, PROBE_NAME)
+    try:
+        with open(probe, "wb") as fh:
+            fh.write(b"ok")
+        os.remove(probe)
+    except OSError as exc:
+        return False, "cannot write into %s: %s" % (root, exc)
+    return True, root
+
+
+def ask_output_root(target, default_root):
+    """
+    Section 8: where should the recovered data be written? Validated before the
+    scan starts, so nothing is lost when the share is not there.
+    Returns a resolved root (default_root when the user keeps the default).
+    """
+    if OUTPUT_ROOT.strip():
+        usable, message = validate_output_root(OUTPUT_ROOT.strip())
+        if usable:
+            if same_local_volume(target, message):
+                print()
+                print("WARNING: OUTPUT_ROOT is on the SAME disk as the source (%s:)."
+                      % source_drive_letter(target).upper())
+                print("Writing there can destroy the data this scan is looking for.")
+            print("Output root     : %s (OUTPUT_ROOT)" % message)
+            return message
+        print()
+        print("WARNING: OUTPUT_ROOT (%s) is not usable: %s"
+              % (OUTPUT_ROOT.strip(), message))
+        print("Writing next to this script instead: %s" % default_root)
+        return default_root
+    print()
+    print("=" * 78)
+    print("WHERE SHOULD THE RECOVERED DATA BE WRITTEN?")
+    print("=" * 78)
+    print("  [1] Next to this script (default): %s" % default_root)
+    print("  [2] Another folder or a network share - typed now")
+    print()
+    print("Writing onto the disk being scanned can overwrite the very data you")
+    print("want back. An external disk or a share (\\\\PC\\RecoveredData) is safest.")
+    print()
+    answer, ok = _ask("Your choice [1]: ")
+    if not ok or answer.strip() not in ("2",):
+        return default_root
+    while True:
+        typed, ok_path = _ask("Folder or share: ")
+        if not ok_path:
+            return default_root
+        typed = typed.strip().strip('"').strip("'")
+        if not typed:
+            return default_root
+        usable, message = validate_output_root(typed)
+        if usable:
+            if same_local_volume(target, message):
+                print()
+                print("WARNING: that folder is on the SAME disk as the source (%s:)."
+                      % source_drive_letter(target).upper())
+                print("Writing there can destroy the data this scan is looking for.")
+                confirm, ok_confirm = _ask("Use it anyway? [y/N]: ")
+                if not ok_confirm or confirm.strip().lower() not in ("y", "yes"):
+                    continue
+            print("Output root     : %s" % message)
+            remember_path("recovered", message)
+            return message
+        print()
+        print("CANNOT USE THAT FOLDER: %s" % message)
+        retry, ok_retry = _ask("Try another folder? [Y/n]: ")
+        if not ok_retry or retry.strip().lower() in ("n", "no"):
+            print("Writing next to this script instead: %s" % default_root)
+            return default_root
+
+
+def ask_save_location(work_dir, target=""):
+    """
+    Ask whether the two run folders should be moved to another disk or share.
+    The chosen root is validated (Section 8) before anything is moved, and the
+    results simply stay where they are when it is not usable.
     Returns the chosen root folder, or "" to keep them where they are.
     """
     print()
     print("Keep the results here, or move them to another disk?")
     print("Choose a folder on a DIFFERENT disk than the scanned one - writing")
     print("onto the damaged disk can overwrite the very data you want to recover.")
+    print("A network share works too: \\\\PC\\RecoveredData")
     print()
     answer, ok = _ask("Move the results to another folder now? [y/N]: ")
     if not ok or answer.strip().lower() not in ("y", "yes"):
@@ -1633,9 +1980,22 @@ def ask_save_location(work_dir):
     if not root:
         print("Results kept in: %s" % work_dir)
         return ""
-    if os.path.abspath(root) == os.path.abspath(work_dir):
+    usable, message = validate_output_root(root)
+    if not usable:
+        print()
+        print("CANNOT USE THAT FOLDER: %s" % message)
         print("Results kept in: %s" % work_dir)
         return ""
+    root = message
+    if os.path.abspath(root) == os.path.abspath(work_dir):
+        print("That is already the folder the results are in.")
+        return ""
+    if same_local_volume(target, root):
+        print()
+        print("WARNING: that folder is on the SAME disk as the source (%s:)."
+              % source_drive_letter(target).upper())
+        print("Writing there can destroy the data this scan is looking for. An")
+        print("external disk or a share is safe; this move is done as you asked.")
     remember_path("recovered", root)
     return root
 
@@ -2181,7 +2541,7 @@ def print_plan_summary(mode, target, total, patterns, case_sensitive,
     if budget:
         print("  time budget : %s hard stop, partial results are kept" % fmt_hms(budget))
     for key, value in extra:
-        print("  %-11s : %s" % (key, value))
+        print("  %-13s : %s" % (key, value))
     print()
     print("Reading is read-only: nothing on the source is modified.")
     print()
@@ -2419,11 +2779,28 @@ def run_fast_flow(target, total):
     print("whether a full scan is worth the hours. Nothing is written to the")
     print("source, and no recovered files are saved: this is a triage pass.")
     print()
+    print()
     try:
-        patterns = build_patterns(CASE_SENSITIVE)
+        pattern_source, profile, profile_name = ask_signature_source()
     except ValueError as exc:
-        print("CONFIG ERROR: %s" % exc)
+        print()
+        print("SIGNATURE ERROR: %s" % exc)
+        print("Nothing was scanned.")
         sys.exit(2)
+    if profile is not None:
+        try:
+            patterns = profile_patterns(profile, CASE_SENSITIVE)
+            print()
+            print("  %s" % profile_summary(profile, profile_name))
+        except ValueError as exc:
+            print("SIGNATURE ERROR: %s" % exc)
+            sys.exit(2)
+    else:
+        try:
+            patterns = build_patterns(CASE_SENSITIVE)
+        except ValueError as exc:
+            print("CONFIG ERROR: %s" % exc)
+            sys.exit(2)
     if not patterns:
         print("CONFIG ERROR: no signatures are configured - nothing to search for.")
         sys.exit(2)
@@ -2436,7 +2813,9 @@ def run_fast_flow(target, total):
         "FAST SCAN - quick triage of the first and last %g%%" % FAST_SCAN_PERCENT,
         target, total, patterns, CASE_SENSITIVE,
         coverage_bytes=coverage, budget=FAST_SCAN_BUDGET,
-        extra=(("regions", "%d (%s)" % (len(ranges),
+        extra=(("signature set", profile_summary(profile, profile_name)
+                if profile is not None else "built-in signatures"),
+               ("regions", "%d (%s)" % (len(ranges),
                                         "first + last" if len(ranges) > 1 else "whole source")),
                ("carving", "off - summary only, no files saved")))
     if not confirm_start():
@@ -2548,20 +2927,32 @@ def run_search_flow(target, total, mode="full"):
     else:
         print("Size            : unknown (will scan until end of media)")
 
-    # ---------------- STEP 2 ----------------
-    print()
-    print("=" * 78)
-    print("STEP 2 of 5 - CHOOSE WHICH FILE TYPES TO SEARCH FOR")
-    print("=" * 78)
-    print("Search for one file extension or several. Every extension brings its")
-    print("own signatures: magic bytes for binary formats, content keywords and")
-    print("extension strings for text formats (.md, .py, .json ...).")
-    print()
+    # ---------------- STEP 2 (Section 7: built-in set or a JSON profile) ----
     try:
-        exts = ask_extensions(build_patterns())
+        pattern_source, profile, profile_name = ask_signature_source()
     except ValueError as exc:
-        print("CONFIG ERROR: %s" % exc)
+        print()
+        print("SIGNATURE ERROR: %s" % exc)
+        print("Nothing was scanned. Fix the file (or choose the built-in set)")
+        print("and run the tool again.")
         sys.exit(2)
+
+    if profile is not None:
+        print()
+        print("The extension menu is skipped: the profile IS the filter.")
+        print("  %s" % profile_summary(profile, profile_name))
+        exts = set(profile)
+    else:
+        print()
+        print("Search for one file extension or several. Every extension brings its")
+        print("own signatures: magic bytes for binary formats, content keywords and")
+        print("extension strings for text formats (.md, .py, .json ...).")
+        print()
+        try:
+            exts = ask_extensions(build_patterns())
+        except ValueError as exc:
+            print("CONFIG ERROR: %s" % exc)
+            sys.exit(2)
 
     # ---------------- STEP 3 ----------------
     print()
@@ -2569,7 +2960,17 @@ def run_search_flow(target, total, mode="full"):
     print("STEP 3 of 5 - CHOOSE CASE SENSITIVITY")
     print("=" * 78)
     case_sensitive = ask_case_sensitive()
-    patterns = filter_patterns_by_extension(build_patterns(case_sensitive), exts)
+    if profile is not None:
+        try:
+            patterns = profile_patterns(profile, case_sensitive)
+        except ValueError as exc:
+            print("PROFILE ERROR: %s" % exc)
+            sys.exit(2)
+    else:
+        patterns = filter_patterns_by_extension(build_patterns(case_sensitive), exts)
+    if not patterns:
+        print("CONFIG ERROR: those choices leave no signature to search for.")
+        sys.exit(2)
 
     # ---------------- STEP 4 ----------------
     print()
@@ -2578,14 +2979,21 @@ def run_search_flow(target, total, mode="full"):
     print("=" * 78)
     print("  extensions  : %s" % ", ".join("." + e for e in sorted(exts)))
     print()
+    work_root = ask_output_root(target, SCRIPT_DIR)
+    print()
     if progressive_mode:
         plan_mode = "PROGRESSIVE SCAN - %d%% slices, a checkpoint after each one" % PROGRESSIVE_PERCENT
     else:
         plan_mode = "FULL SCAN - one complete pass over the source"
+    if profile is not None:
+        sig_row = profile_summary(profile, profile_name)
+    else:
+        sig_row = "built-in signatures"
+    plan_extra = [("signature set", sig_row),
+                  ("file types", ", ".join("." + e for e in sorted(exts))),
+                  ("output root", work_root)]
     print_plan_summary(plan_mode, target, total, patterns, case_sensitive,
-                       coverage_bytes=total or None,
-                       extra=(("recovered", "collected in %s, saved where you choose after the scan"
-                               % SCRIPT_DIR),))
+                       coverage_bytes=total or None, extra=tuple(plan_extra))
     if not confirm_start():
         print("Stopped. Nothing was scanned.")
         sys.exit(0)
@@ -2612,7 +3020,7 @@ def run_search_flow(target, total, mode="full"):
 
     # ---- run folders (Section 1 + 2): one pair per run, provenance-stamped ----
     started_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    recovered_dir, organized_dir, run_id = make_run_dirs(SCRIPT_DIR, target, total)
+    recovered_dir, organized_dir, run_id = make_run_dirs(work_root, target, total)
     results_path = os.path.join(recovered_dir, RESULTS_FILE)
     carve_dir = os.path.join(recovered_dir, "carved") if ENABLE_CARVING else None
     print("results folder  : %s" % recovered_dir)
@@ -2697,8 +3105,16 @@ def run_search_flow(target, total, mode="full"):
     if summary_path:
         print("  summary        : %s" % summary_path)
 
-    # ask WHERE to keep the two run folders (Section 1/2 keep them siblings)
-    final_root = ask_save_location(SCRIPT_DIR)
+    # ask WHERE to keep the two run folders (Section 1/2 keep them siblings).
+    # A root chosen in STEP 4 (Section 8) is already the final home.
+    final_root = ""
+    if os.path.abspath(work_root) == os.path.abspath(SCRIPT_DIR):
+        final_root = ask_save_location(SCRIPT_DIR, target)
+    else:
+        print()
+        print("SAVED TO: %s" % work_root)
+        print("  %s" % recovered_dir)
+        print("  %s" % organized_dir)
     if final_root:
         try:
             new_recovered = shutil.move(recovered_dir, final_root)
@@ -3360,6 +3776,12 @@ FAST_SCAN_REPORT = "fast_scan_report.txt"
 # uses DEFAULT_SCAN_RATE and says so on screen instead of pretending.
 SPEED_FILE = "scan_speed.json"
 DEFAULT_SCAN_RATE = 60 * 1024 * 1024
+
+# Where recovered data is written (V5 Section 8). Empty = asked during the run
+# (default: next to this script). Set it to an external disk or a network share
+# and it is validated BEFORE the scan starts; when it is not usable the run
+# falls back to the script folder instead of failing after hours of scanning.
+OUTPUT_ROOT = ""
 
 # Magic-byte signatures: label -> hex bytes (or bytes). Binary formats with a
 # fixed, well-known header. Add more whenever you need them.

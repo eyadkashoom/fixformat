@@ -88,6 +88,30 @@ The hardware is read once; the image can be re-analyzed with different
 signature sets, again and again, at full speed and zero risk to the original
 disk.
 
+## The v5 main menu (in development)
+
+`v5/` rebuilds the same tool on top of release 4 and changes the menu. Run
+`v5/run_scan.bat` (or the bundled interpreter: `python/python.exe v5/raw_scan.py`):
+
+- **1 - FAST SCAN (quick triage).** Reads only the first 5% and the last 5% of
+  the source, inside a hard 5-minute budget, and reports hit counts per
+  signature, sample file names, the percentage of all-zero regions (the trace
+  of a wiped, encrypted or TRIMmed SSD) and an estimate of what the whole disk
+  holds. It saves no files: it decides whether a full scan is worth the hours.
+- **2 - FULL SCAN (complete pass).** The whole source, carved.
+- **3 - PROGRESSIVE SCAN (chunked, 5% at a time).** The same scan with a
+  checkpoint after every 5%, so a long run can be stopped and continued.
+- **4 - CREATE DISK IMAGE.** Unchanged from release 3/4.
+- **5 - ANALYZE EXISTING IMAGE.** Unchanged, now picked from a numbered list.
+- **6 - RESUME PREVIOUS RECOVERY.** Continues a `recovered_*` folder from the
+  offset it stopped at, with its own signatures, and refuses one that already
+  finished.
+
+Every scan now prints a `PLAN FOR THIS RUN` block first: mode, how much will be
+read, signature count and an estimated duration taken from the last run
+measured on this machine (`scan_speed.json`), or a clearly-labelled default
+when nothing has been measured yet.
+
 ## How a search runs (menu options 1 and 3)
 
 - **STEP 1 - CHOOSE THE TARGET.** All physical disks are listed with their
