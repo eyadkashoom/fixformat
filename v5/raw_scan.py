@@ -1209,29 +1209,36 @@ def carve_phase(f, hits, total_size, carve_dir, before, after, carve_limit,
     total = len(ordered)
     carved = 0
     last = [0.0]
-    for done, hit in enumerate(ordered, 1):
-        label = hit["label"]
-        if carve_limit and carved_counts.get(label, 0) >= carve_limit:
-            hit["carved"] = "(carve limit reached)"
-            continue
-        path = carve_window(reader, hit["offset"], hit.get("plen", 1), total_size,
-                            carve_dir, label, hit.get("ext", ""), before, after,
-                            smart_text=ENABLE_SMART_TEXT, triage=ENABLE_TRIAGE)
-        hit["carved"] = path
-        if path and not path.startswith("(carve failed"):
-            carved_counts[label] = carved_counts.get(label, 0) + 1
-            carved += 1
-            log("CARVED | %s | offset=0x%016X | %s" % (label, hit["offset"], path))
-        elif path:
-            log("CARVE PROBLEM | %s | offset=0x%016X | %s"
-                % (label, hit["offset"], path))
-        if show_progress:
-            t = time.time()
-            if t - last[0] >= 0.5 or done == total:
-                last[0] = t
-                sys.stdout.write("\rCarving %d / %d hits (%d files)   "
-                                 % (done, total, carved))
-                sys.stdout.flush()
+    try:
+        for done, hit in enumerate(ordered, 1):
+            label = hit["label"]
+            if carve_limit and carved_counts.get(label, 0) >= carve_limit:
+                hit["carved"] = "(carve limit reached)"
+                continue
+            path = carve_window(reader, hit["offset"], hit.get("plen", 1), total_size,
+                                carve_dir, label, hit.get("ext", ""), before, after,
+                                smart_text=ENABLE_SMART_TEXT, triage=ENABLE_TRIAGE)
+            hit["carved"] = path
+            if path and not path.startswith("(carve failed"):
+                carved_counts[label] = carved_counts.get(label, 0) + 1
+                carved += 1
+                log("CARVED | %s | offset=0x%016X | %s" % (label, hit["offset"], path))
+            elif path:
+                log("CARVE PROBLEM | %s | offset=0x%016X | %s"
+                    % (label, hit["offset"], path))
+            if show_progress:
+                t = time.time()
+                if t - last[0] >= 0.5 or done == total:
+                    last[0] = t
+                    sys.stdout.write("\rCarving %d / %d hits (%d files)   "
+                                     % (done, total, carved))
+                    sys.stdout.flush()
+    except KeyboardInterrupt:
+        # the windows written so far are already on disk - report that number
+        print("\nStopped by the user while carving - %d file(s) written so far."
+              % carved)
+        log("carving interrupted by the user after %d files" % carved)
+        return carved
     if show_progress:
         print()
     return carved
@@ -1382,17 +1389,25 @@ def parallel_phase1(target, patterns, start_offset, end_offset, chunk_size, work
     scanned = 0
     zero_bytes = 0
     budget_hit = False
+    interrupted = False
     ctx = multiprocessing.get_context("spawn")
-    with ctx.Pool(processes=min(workers, len(jobs))) as pool:
-        for done, part in enumerate(pool.imap_unordered(_scan_range_worker, jobs), 1):
-            parts.extend(part.get("hits") or [])
-            scanned += part.get("scanned") or 0
-            zero_bytes += part.get("zero_bytes") or 0
-            budget_hit = budget_hit or bool(part.get("budget_hit"))
-            if show_progress:
-                sys.stdout.write("\rParallel phase 1: %d / %d ranges done, %d hits   "
-                                 % (done, len(jobs), len(parts)))
-                sys.stdout.flush()
+    try:
+        with ctx.Pool(processes=min(workers, len(jobs))) as pool:
+            for done, part in enumerate(pool.imap_unordered(_scan_range_worker, jobs), 1):
+                parts.extend(part.get("hits") or [])
+                scanned += part.get("scanned") or 0
+                zero_bytes += part.get("zero_bytes") or 0
+                budget_hit = budget_hit or bool(part.get("budget_hit"))
+                if show_progress:
+                    sys.stdout.write("\rParallel phase 1: %d / %d ranges done, %d hits   "
+                                     % (done, len(jobs), len(parts)))
+                    sys.stdout.flush()
+    except KeyboardInterrupt:
+        # Ctrl+C lands in the parent process while the pool runs. The ranges
+        # that already came back are real results: keep them, and never restart
+        # the source from byte 0 (that would double-count and waste the read).
+        interrupted = True
+        print("\nStopped by the user - keeping the ranges that already finished.")
     if show_progress:
         print()
 
@@ -1404,13 +1419,13 @@ def parallel_phase1(target, patterns, start_offset, end_offset, chunk_size, work
             kept.append(hit)
     kept.sort(key=lambda h: (h["label"], h["offset"]))
     return {"hits": kept, "scanned": scanned, "zero_bytes": zero_bytes,
-            "budget_hit": budget_hit}
+            "budget_hit": budget_hit, "interrupted": interrupted}
 
 
 def scan(target, patterns, chunk_size, results_path, carve_dir=None,
          carve_before=4096, carve_after=65536, show_progress=True,
          min_gap=0, carve_limit=0, start_offset=0, end_offset=None,
-         deadline=None):
+         deadline=None, carved_counts=None):
     """
     Scan `target` for `patterns` = (label, bytes, ext, case_insensitive) tuples.
     `start_offset`/`end_offset` restrict the scan to one byte range (progressive
@@ -1437,7 +1452,10 @@ def scan(target, patterns, chunk_size, results_path, carve_dir=None,
 
     hits = []
     counts = dict((p[0], 0) for p in pat_list)
-    carved_counts = {}
+    # a caller (progressive scanning) passes its own dict so CARVE_LIMIT is a
+    # budget for the WHOLE run, not per slice - otherwise twenty slices allow
+    # twenty times the files (review S11)
+    carved_counts = {} if carved_counts is None else carved_counts
     scanned = 0
     zero_bytes = 0
     use_parallel = False
@@ -1528,11 +1546,21 @@ def scan(target, patterns, chunk_size, results_path, carve_dir=None,
                     print("\n".join(pending))
                     del pending[:]
                 budget_hit = bool(found.get("budget_hit"))
+                if found.get("interrupted"):
+                    interrupted = True
                 zero_bytes += found.get("zero_bytes") or 0
                 # the workers count only the bytes inside their own range, so
                 # this is exact for a full pass, a slice and a partial one
                 scanned = found.get("scanned") or total_size
                 use_parallel = True
+            except KeyboardInterrupt:
+                # defensive: keep the hits collected so far and never restart
+                # the source from byte 0 after the user asked to stop
+                interrupted = True
+                use_parallel = True
+                print("\nStopped by the user during the parallel pass - partial "
+                      "results are kept.")
+                log("parallel phase interrupted by the user")
             except Exception as exc:      # a broken pool must never lose the scan
                 log("parallel phase failed: %s - falling back to one process" % exc)
                 print("Parallel scan failed (%s) - falling back to one process." % exc)
@@ -1646,9 +1674,15 @@ def scan(target, patterns, chunk_size, results_path, carve_dir=None,
             print("-" * 78)
             print("PHASE 2 - CARVING %d HITS (one forward read of the source)" % len(hits))
             print("-" * 78)
-            carved_files = carve_phase(f, hits, total_size, carve_dir,
-                                       carve_before, carve_after, carve_limit,
-                                       carved_counts, log, show_progress)
+            try:
+                carved_files = carve_phase(f, hits, total_size, carve_dir,
+                                           carve_before, carve_after, carve_limit,
+                                           carved_counts, log, show_progress)
+            except KeyboardInterrupt:
+                interrupted = True
+                print("\nStopped by the user while carving - the files written so "
+                      "far are kept.")
+                log("carving interrupted by the user")
 
         elapsed = time.time() - started
         log("=== SCAN END %s === status=%s" % (now(), "INTERRUPTED" if interrupted else "COMPLETE"))
@@ -2139,6 +2173,50 @@ def find_recoveries(roots=None, depth=1):
     return found
 
 
+def patterns_from_provenance(prov):
+    """
+    Rebuild the exact pattern list a run used (review S6).
+    `signature_bytes` is authoritative: it carries the bytes, so renaming a
+    label or flipping an encoding option can never change what a resumed half of
+    the source is scanned with. Returns (patterns, warnings); an empty pattern
+    list means "cannot be continued safely".
+    """
+    warnings = []
+    if not isinstance(prov, dict):
+        return [], ["no provenance was read"]
+    stored = prov.get("signature_bytes")
+    if isinstance(stored, list) and stored:
+        patterns = []
+        for entry in stored:
+            try:
+                pattern = bytes.fromhex(str(entry[1]))
+                if not pattern:
+                    raise ValueError("empty pattern")
+                patterns.append((str(entry[0]), pattern, str(entry[2]),
+                                 bool(entry[3])))
+            except (IndexError, TypeError, ValueError):
+                warnings.append("unreadable stored signature: %r" % (entry,))
+        if not patterns:
+            warnings.append("none of the stored signatures could be rebuilt")
+        return patterns, warnings
+
+    # provenance written before this key existed: labels only, so the current
+    # config is the best available guess - and the user must be told
+    labels = list(prov.get("signature_labels") or [])
+    wanted = set(labels)
+    patterns = [entry for entry in build_patterns(bool(prov.get("case_sensitive", True)))
+                if not wanted or entry[0] in wanted]
+    warnings.append("this recovery predates stored signature bytes: its patterns "
+                    "were rebuilt from labels (%d rebuilt)" % len(patterns))
+    missing = wanted - set(entry[0] for entry in patterns)
+    if missing:
+        warnings.append("%d label(s) no longer exist in the config: %s"
+                        % (len(missing), ", ".join(sorted(missing)[:5])))
+    if not patterns:
+        warnings.append("no signature could be rebuilt")
+    return patterns, warnings
+
+
 def provenance_payload(target, total, summary, patterns, case_sensitive,
                        started_at, progress=None, profile="", profile_name=""):
     """The provenance.json body for one run (Section 1)."""
@@ -2153,6 +2231,9 @@ def provenance_payload(target, total, summary, patterns, case_sensitive,
         "source_size_text": fmt_bytes(total) if total else "unknown",
         "signatures": len(patterns),
         "signature_labels": [p[0] for p in patterns],
+        # the bytes themselves (review S6): a resumed run must search with the
+        # same patterns even if a label is renamed or the encoding list changes
+        "signature_bytes": [[p[0], p[1].hex(), p[2], bool(p[3])] for p in patterns],
         "case_sensitive": bool(case_sensitive),
         "min_gap": MIN_GAP,
         "carve_before": CARVE_BEFORE,
@@ -2396,6 +2477,7 @@ def run_progressive(target, total, patterns, case_sensitive, recovered_dir,
         combined["resume_offset"] = total
         return combined
 
+    carved_totals = {}          # shared across slices: one budget per run
     slice_no = 0
     while True:
         slice_no += 1
@@ -2410,7 +2492,8 @@ def run_progressive(target, total, patterns, case_sensitive, recovered_dir,
             part = scan(target, patterns, CHUNK_SIZE, results_path, carve_dir,
                         CARVE_BEFORE, CARVE_AFTER, show_progress=True,
                         min_gap=MIN_GAP, carve_limit=CARVE_LIMIT,
-                        start_offset=start, end_offset=end)
+                        start_offset=start, end_offset=end,
+                        carved_counts=carved_totals)
         except KeyboardInterrupt:
             print("\nStopped by the user - everything found so far is kept.")
             combined["stopped_early"] = True
@@ -3622,10 +3705,16 @@ def resume_flow(resumed):
     """Section 3: continue a previous recovery, in place (menu option 6)."""
     resume_target, resume_prov, resume_offset = resumed
     resume_total = int(resume_prov.get("source_size") or 0)
-    labels = set(resume_prov.get("signature_labels") or [])
     resume_case = bool(resume_prov.get("case_sensitive", True))
-    resume_patterns = [p for p in build_patterns(resume_case)
-                       if not labels or p[0] in labels]
+    resume_patterns, resume_warnings = patterns_from_provenance(resume_prov)
+    for warning in resume_warnings:
+        print("NOTE: %s" % warning)
+    if not resume_patterns:
+        print()
+        print("This recovery cannot be continued safely: its signature set")
+        print("cannot be rebuilt. Start a new scan (option 2 or 3) instead -")
+        print("the old folder is left untouched.")
+        return
     recovered_dir = resume_prov.get("recovered_dir") or ""
     organized_dir = resume_prov.get("organized_dir") or ""
     if not organized_dir or not os.path.isdir(organized_dir):

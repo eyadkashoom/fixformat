@@ -590,6 +590,108 @@ def main():
         if not os.path.isfile(readable):
             failures.append("no separate readable transcript was written")
 
+    # regression (review S4): Ctrl+C inside the parallel pool or while carving
+    # returns a partial summary instead of a traceback
+    saved_par = raw_scan.parallel_phase1
+    saved_minsize = raw_scan.PARALLEL_MIN_SIZE
+    saved_workers3 = raw_scan.PARALLEL_WORKERS
+
+    def _raise_interrupt(*args, **kwargs):
+        raise KeyboardInterrupt
+
+    raw_scan.parallel_phase1 = _raise_interrupt
+    raw_scan.PARALLEL_MIN_SIZE = 0
+    raw_scan.PARALLEL_WORKERS = 2
+    try:
+        intr = raw_scan.scan(img, patterns, CHUNK, os.path.join(tmpdir, "intr.txt"),
+                             None, show_progress=False, min_gap=0)
+    finally:
+        raw_scan.parallel_phase1 = saved_par
+        raw_scan.PARALLEL_MIN_SIZE = saved_minsize
+        raw_scan.PARALLEL_WORKERS = saved_workers3
+    if not intr.get("interrupted"):
+        failures.append("Ctrl+C in the parallel pool was not recorded as interrupted")
+
+    saved_carve_phase = raw_scan.carve_phase
+    raw_scan.carve_phase = _raise_interrupt
+    try:
+        intr2 = raw_scan.scan(img, patterns, CHUNK, os.path.join(tmpdir, "intr2.txt"),
+                              os.path.join(tmpdir, "intr2_carved"),
+                              show_progress=False, min_gap=MIN_GAP)
+    finally:
+        raw_scan.carve_phase = saved_carve_phase
+    if not intr2.get("interrupted") or not intr2["hits"]:
+        failures.append("Ctrl+C while carving lost the hits or the interrupted flag")
+
+    # regression (review S6): provenance carries the pattern BYTES, so a resume
+    # cannot silently search with a different set after a label rename
+    byte_pats = [("Profile .dwg AC10 [utf-8]", b"AC10", "dwg", False),
+                 ("PDF document (.pdf)", b"%PDF-", "pdf", False)]
+    byte_prov = raw_scan.provenance_payload(
+        "x.img", 1024, {"hits": [], "counts": {}, "bytes_scanned": 0,
+                        "elapsed": 0.01, "carved_files": 0, "interrupted": False},
+        byte_pats, True, "2026-10-29 09:00:00")
+    byte_dir = os.path.join(tmpdir, "byte_prov")
+    os.makedirs(byte_dir)
+    raw_scan.write_provenance(byte_dir, byte_prov)
+    rebuilt, rebuilt_warnings = raw_scan.patterns_from_provenance(
+        raw_scan.read_provenance(byte_dir))
+    if rebuilt != byte_pats:
+        failures.append("patterns_from_provenance = %r" % (rebuilt,))
+    if rebuilt_warnings:
+        failures.append("stored signatures produced warnings: %r" % (rebuilt_warnings,))
+    renamed = dict(byte_prov)
+    renamed["signature_labels"] = ["a renamed label"] * len(byte_pats)
+    renamed_bytes = [entry[1] for entry in raw_scan.patterns_from_provenance(renamed)[0]]
+    if renamed_bytes != [entry[1] for entry in byte_pats]:
+        failures.append("a label rename changed the stored pattern bytes")
+    broken_prov = dict(byte_prov)
+    broken_prov["signature_bytes"] = [["x", "zzzz", "md", False]]
+    broken_pats, broken_warns = raw_scan.patterns_from_provenance(broken_prov)
+    if broken_pats or not broken_warns:
+        failures.append("unreadable stored signatures were accepted")
+
+    # regression (review S11): CARVE_LIMIT is one budget for the WHOLE run, not
+    # per slice - four slices must not produce four times the files
+    span_img = os.path.join(tmpdir, "span.img")
+    span_blob = bytearray(b"." * (4 * 1024 * 1024))
+    for index in range(4):
+        at = index * 1024 * 1024 + 5000
+        span_blob[at:at + 3] = b".md"
+    with open(span_img, "wb") as fh:
+        fh.write(bytes(span_blob))
+    span_runs = os.path.join(tmpdir, "span_runs")
+    span_org = os.path.join(tmpdir, "span_org")
+    os.makedirs(span_runs)
+    os.makedirs(span_org)
+    saved_limit2 = raw_scan.CARVE_LIMIT
+    saved_gap2 = raw_scan.MIN_GAP
+    saved_ask2 = raw_scan._ask
+    raw_scan.CARVE_LIMIT = 2
+    raw_scan.MIN_GAP = 0
+    raw_scan._ask = lambda prompt="": ("y", True)
+    try:
+        span = raw_scan.run_progressive(span_img, os.path.getsize(span_img),
+                                        [("Extension .md [utf-8]", b".md", "md", False)],
+                                        True, span_runs, span_org,
+                                        "2026-10-29 09:00:00", percent=10)
+    finally:
+        raw_scan.CARVE_LIMIT = saved_limit2
+        raw_scan.MIN_GAP = saved_gap2
+        raw_scan._ask = saved_ask2
+    span_files = 0
+    for root in (span_runs, span_org):
+        for cur, _dirs, files in os.walk(root):
+            span_files += len([name for name in files if name.endswith(".md")
+                               and not name.endswith(".triage.txt")
+                               and not name.endswith(raw_scan.READABLE_SUFFIX)])
+    if span_files > 2:
+        failures.append("carve budget leaked across slices: %d files, limit 2"
+                        % span_files)
+    if span["carved_files"] != span_files:
+        failures.append("combined carved_files %d != %d files on disk"
+                        % (span["carved_files"], span_files))
+
     # results log must contain every reported hit
     with open(results, "r", encoding="utf-8") as fh:
         log_text = fh.read()
@@ -615,7 +717,9 @@ def main():
     print("step 6 verified: JSON signature profiles (parse/load/refusals/profile scan),")
     print("output-root validation, UNC detection and the same-volume warning trigger.")
     print("review regressions covered: boundary hits across slices, an interrupted slice")
-    print("recorded as interrupted, byte-exact .txt windows with a separate transcript.")
+    print("recorded as interrupted, byte-exact .txt windows with a separate transcript,")
+    print("Ctrl+C inside the pool and while carving, pattern bytes in provenance and")
+    print("one carve budget across slices.")
     shutil.rmtree(tmpdir, ignore_errors=True)
     sys.exit(0)
 
