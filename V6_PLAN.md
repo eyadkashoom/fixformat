@@ -27,6 +27,65 @@ tool. That is where v6 should spend its effort, and the tools below show why.
 
 ---
 
+## 0b. The finding that rewrites the plan (measured 2026-10-29)
+
+The two probes on the user's image changed the shape of this release. Everything
+below is verified twice: by the probe agents and independently by the parent.
+
+**The volume that matters is BitLocker-encrypted.**
+
+| Fact | Value | How it was read |
+|---|---|---|
+| GPT | intact at LBA 1, 6 partitions | MBR stub with one `0xEE` entry, `EFI PART` at LBA 1 |
+| partition 2 | 461.09 GiB, LBA 1,288,192 .. 968,261,631, "Basic data partition" | GPT entry |
+| its VBR, offset 3 | `-FVE-FS-` (BitLocker), first sector `eb 58 90 2d` | 512-byte read |
+| its entropy | 7.99-8.00 bits/byte at +0, +1, +8, +20, +40, +64, +66, +68 GiB | 64 KiB samples |
+| its real content | ends near +68 GiB; zeros from +69 GiB to the end | 64 KiB sweep |
+| plaintext NTFS volumes | only the three OEM ones: 1.14 GiB WinRE, 12.08 GiB Dell factory, 2.00 GiB vendor rescue | VBR `NTFS    ` |
+| files on those volumes | 417 real files, 11.14 GiB, all OEM/recovery payload | MFT walk, cross-checked against each `$I30` |
+
+Three consequences, in order of importance:
+
+1. **This image cannot yield the user's old data.** The MFT, `$Recycle.Bin`,
+   `System Volume Information`, `$UsnJrnl` and every file of the system volume
+   are inside the ciphertext. No key exists in the image: the ESP holds no
+   `.bek`, and no FVE metadata block was found. Recovery of that volume needs the
+   48-digit recovery password or a `.bek` file, and then a decrypting layer
+   (`manage-bde` on a mounted VHD, or dislocker) - outside a carver's reach.
+2. **Section 4's kill criterion fired.** MFT triage stays in the plan, but not as
+   this image's headline: it delivers 417 OEM files here and would deliver a real
+   user's files *only on a plaintext volume*. Its priority drops below the FVE
+   gate and the validators.
+3. **The 8,675 "noise hits" of 5.0.0 were ciphertext, not markup.** A two-byte
+   needle matches once per 65,536 random bytes; 256 MiB / 65,536 = 4,096 expected
+   matches, and 557 were observed for the removed needle on the alignment slab -
+   the same order. That is the strongest argument yet for the validators in
+   Section 8, and it is now evidence instead of intuition.
+
+**Also confirmed: the image is holey.** It is a real 512,107,741,184-byte file
+(not sparse), but the data partition is zeros past ~68 GiB. Every "476.94 GiB"
+statement in Section 1 must be read as "the first ~68 GiB of the data volume plus
+~15 GiB of plaintext OEM volumes". The rates measured there are still valid - they
+were measured on real data - but the whole-image projections were extrapolations
+over mostly zero.
+
+### What v6 now does first: the FVE gate
+
+One 512-byte read per partition, before any scanning:
+
+```
+[FVE] partition 2 (461.09 GiB) is BitLocker-encrypted (-FVE-FS-).
+      Carving it would produce false positives only: encrypted data has no
+      headers and no structure.
+      What you need: the 48-digit recovery password, or a .bek key file, or the
+      key in your Microsoft account.
+      What this run can still do: the plaintext partitions (1.14 + 12.08 + 2.00 GiB)
+      -> 417 files, 11.14 GiB, all OEM payload.
+```
+
+Rules for the gate: detect, never guess a key, never attempt decryption, and never
+let the scan of an encrypted volume produce candidates that look recoverable.
+
 ## 1. Baseline: what v5.0.0 actually does on this disk
 
 Measured on `F:\hard512\diskimage_PhysicalDrive0_20261028_090245.img.partial`
@@ -519,7 +578,7 @@ CREATE TABLE plan (id INTEGER PRIMARY KEY, run_id INTEGER, rule TEXT,
 
 | # | Decision | Status |
 |---|---|---|
-| D1 | Build the MFT/`$UsnJrnl` triage pass? | **APPROVED** by the user; still gated on the survival probe (Section 4) |
+| D1 | Build the MFT/`$UsnJrnl` triage pass? | **APPROVED, but demoted**: the probe found the data volume encrypted (0b), so triage pays off only on plaintext volumes. Still worth building - after the FVE gate |
 | D2 | Cluster stride instead of byte-exact scanning? | **REJECTED by measurement** - 0 of 61 real hits were aligned |
 | D7 | Ask whether the machine is in use, and map it to workers + priority (2.1) | **APPROVED** by the user |
 | D8 | One SQLite database per run (9b) | **APPROVED** by the user - `sqlite3` is in the bundled interpreter |
@@ -542,7 +601,8 @@ CREATE TABLE plan (id INTEGER PRIMARY KEY, run_id INTEGER, rule TEXT,
 | 0 | `v6/` from `v5/`, `VERSION = "6.0"`, v5 selftest green in `v6/` | a green base before any change |
 | 1 | `audit.txt` + the profile `footer`/`max_size` fields | small, independent, immediately useful |
 | 2 | Validators for JPEG/PNG/PDF/ZIP + a `confidence` field, attached to carve results | kills the noise class; prerequisite for everything in Section 8 |
-| 3 | The MFT survival probe on the real image (measurement, not code) | decides whether step 4 happens at all |
+| 3 | ~~The MFT survival probe~~ **DONE** (0b): the volume is BitLocker, so the answer is 'unreadable', not 'clean' | measurement complete |
+| 3b | **The FVE gate**: detect BitLocker per partition, refuse to carve ciphertext, explain the key path | now the first feature of v6 - it protects every later feature from producing confident nonsense |
 | 4 | Triage pass: MFT + `$Bitmap` + `$UsnJrnl:$J`, name map, direct recovery | the biggest win if the probe passes |
 | 4a | Walk the MFT to `$Recycle.Bin` and `System Volume Information`; parse `$I`/`$R`; probe for VSS stores | cheap, and it hands back whole named files before any carving |
 | 4b | If the probe finds stores: a VSS reader (catalog + 16 KiB block map) | high effort, decide on the probe result |
