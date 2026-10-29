@@ -57,8 +57,12 @@ All releases contain the same file set:
 ## Embedded Python - run it without installing anything
 
 The tool is meant to run inside a temporary Mini Windows environment where
-installing Python is pointless (the session is gone after reboot). The
-solution is the official **embeddable Python package** - a self-contained
+installing Python is pointless (the session is gone after reboot). This is not a
+guess - v4 was run from a Mini Windows (WinPE) session with no changes and no
+installed Python, so portability is a tested property, not an intention. Treat a
+new dependency as a release blocker: stdlib only, the bundled `python/` folder as
+shipped, no pip, no service, no registry writes.
+The solution is the official **embeddable Python package** - a self-contained
 folder, no installation, no registry, no traces left behind.
 
 1. Download `python-3.x.x-embed-amd64.zip` from

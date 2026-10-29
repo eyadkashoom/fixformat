@@ -591,6 +591,7 @@ CREATE TABLE plan (id INTEGER PRIMARY KEY, run_id INTEGER, rule TEXT,
 | D12 | One mode or two (`extract as we go` / `report first`)? | **APPROVED: two modes** (9d); report-first needs no output space and always ends at the planner |
 | D13 | Stop/resume available in every stage? | **APPROVED: always** - `P` pauses, `Q` checkpoints, both modes resume |
 | D14 | Any code path written for one specific disk or one user's situation? | **APPROVED: no.** The tool serves every case: the FVE gate, the modes, the caps and the planner are general features with tests on synthetic images, never branches for a single customer's disk |
+| D15 | Is Mini Windows / WinPE a supported host? | **YES, and it already works** - v4 ran there with no changes. Nothing in v6 may add a dependency that a USB folder cannot carry: stdlib only, the bundled `python/` folder as shipped, no pip, no service, no registry, no admin requirement beyond reading a raw device |
 | D3 | Fragmented assembly scope | JPEG, PNG, PDF, ZIP/OOXML, SQLite; sequential + BGC, no SmartCarving |
 | D4 | Direct I/O option | yes, as an opt-in, kept only if the real-image measurement shows no slowdown |
 | D5 | Output budget per run | **APPROVED by the user**: `OUTPUT_CAP_GB = 100`, `OUTPUT_CAP_PERCENT = 25` of the destination's free space (whichever is smaller), `OUTPUT_CAP_FILES = 200000`, `FREE_RESERVE_MB = 2048`. Behaviour at the cap is asked at runtime, not fixed (D11). |
