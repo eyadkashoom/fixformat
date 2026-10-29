@@ -481,15 +481,43 @@ and mmap (13.6) only pays on repeated scans of the same image.
 
 | 6 | **done** | **Sections 7 + 8.** Profile: `parse_signature_profile` / `load_signature_profile` / `profile_patterns` / `profile_summary`, reached from STEP 2 of both the full and the fast scan through a numbered `.json` picker; hex is spaces-between-bytes and a bare token is TEXT (AutoCAD's `AC10` really is text), every malformed entry raises a message that names the key and **stops the run** instead of silently scanning with the built-in set. Output root: `validate_output_root` (creates the folder and proves it writable with a probe file), `ask_output_root` before the plan + `OUTPUT_ROOT` config, `same_local_volume` / `source_drive_letter` for the non-blocking same-disk warning, and a local fallback when the share is unusable. Verified by scripted runs: a `.md`+`.pdf` profile produced `recovered_*` inside the chosen root with 3 profile signatures in `provenance.json` and nothing written next to the script; a broken profile exited 2 with `SIGNATURE ERROR: profile entry .md has no signatures`; an unusable root printed `CANNOT USE THAT FOLDER` and the scan completed next to the script. Selftest covers parse/load/refusals, a profile-driven scan, root validation, UNC detection and the same-volume trigger. Gap kept for step 7/8: a share that disappears **mid-run** is caught by the final move (results stay local), not detected during the scan |
 
+## Review pass (independent agent on commit `802df9f`)
+
+`v5/REVIEW_v5_steps0-5.md` (kept in the repo) found three blockers and eleven
+should-fix items. Each blocker was reproduced by a probe before any code
+changed, and each now has a regression test in `v5/selftest.py`.
+
+| Finding | Reproduced how | State |
+|---|---|---|
+| **B1** a hit that straddles a slice boundary was lost by both slices (sequential reads stopped at `end_offset`, and the next range rejected `abs_off < start_offset`) - a permanent `max_len-1` dead band at every 5% boundary | 2003-byte image, `.md` at 1000, slices `[0,1001)` + `[1001,end)` -> `[]` + `[]` | **fixed**: bounded scans read to `end_offset + max_len` and each range owns `[start_offset, end_offset)`; probe now `[1000]` + `[]`, stitched `[1000]` |
+| **B2** a slice stopped with Ctrl+C was written as `complete` with `resume_offset == total`, so it could never be resumed | fake interrupted scan through `run_progressive` -> `status=complete`, `resume_offset=4096` | **fixed**: `resume_offset = start + bytes_scanned`, `status=interrupted`, loop breaks instead of asking to continue; probe -> `2048` / `interrupted` |
+| **B3** for every `.txt` signature the readable copy was written to the SAME path as the raw window and destroyed it (`errors="replace"`) | carve `HEAD\xc7\xe1\xffTAIL` -> on disk `HEAD\xef\xbf\xbd\xef\xbf\xbd\xef\xbf\xbdTAIL` | **fixed**: the transcript is `_readable.txt`; probe and test now byte-exact |
+| S1 `sampled_bytes` inflated by the 4 KiB pre-roll | 4 MiB image: sequential 422707 vs parallel 419430 | **fixed**: bytes counted only where they overlap the range; selftest asserts exactly `2 * head_span` |
+| S2 a fast scan that read nothing still said "wiped / encrypted / TRIMmed" | `budget=-1` -> 0 B sampled + wiped-disk verdict | **fixed**: below 1% of the source the tool says the budget ran out and refuses to judge |
+| S3 "recoverable data" was hits x the full carve window | - | **renamed** to `carved-window bytes` with the formula and a smart-text caveat; not printed for a partial sample |
+| S9 run folders were created outside the guarded block | read-only root -> traceback | **fixed** for the run folders and the organized step; the message points at `recovered_dir` |
+| S4 Ctrl+C during the parallel pool or carving still raises (findings S4, S5, S6, S7, S8, S10, S11) | not yet fixed | **open - first work of step 7** |
+
+Open by design, recorded in `v5/STEP6_ACCEPTANCE.md`: the `[U]` picker does not
+print its own "Not reachable" line (validation still refuses the folder one step
+later), and a share that disappears **mid-run** is only caught when the final
+move fails.
+
 ## Next step
 
-Steps 0-6 are done and committed. **Step 7 is next**: Section 13.6 mmap for
-image files, then 13.8 - the first measurement on real media instead of a
-synthetic fixture (the only numbers so far are 4.3x on a 256 MB fixture, and
-every fast-scan figure comes from a 100 MB synthetic image).
+Steps 0-6 are done; the review pass closed the three blockers. **Step 7 is next**:
 
-Then step 8: Section 12's same-physical-disk refusal on the destination (today
-it is a warning, not a refusal), tag `v5.0.0`, the release with
-`python-embed.zip`, and v5 in CI.
+1. the open should-fix items from the review - S4 (Ctrl+C inside the parallel
+   pool or carving must return a partial summary, not a traceback), S5
+   (`summary.txt` reports 0 files because the move empties `carved/`), S6
+   (provenance stores labels only, not pattern bytes, so a resumed half can be
+   scanned with a different set), S7 (a resume overwrites the folder's
+   cumulative totals), S8 (`scan_speed.json` mixes fast-scan and full-scan
+   throughput), S10 (one worker error discards every completed range), S11
+   (`CARVE_LIMIT` resets per slice, so twenty slices allow 20x the files);
+2. Section 13.6 mmap for image files, then 13.8 - the first measurement on real
+   media (every number so far is a synthetic fixture);
+3. then step 8: the same-physical-disk refusal (today it warns), tag `v5.0.0`,
+   the release with `python-embed.zip`.
 
 Nothing in v5 has ever run against a real disk or a real image file.

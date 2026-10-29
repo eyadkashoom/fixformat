@@ -363,8 +363,8 @@ def main():
     if any(head_span <= o < tail_start for o in offsets):
         failures.append("fast scan reported a hit outside the sampled regions: %r"
                         % [o for o in offsets if head_span <= o < tail_start])
-    if not (2 * head_span <= fast["sampled_bytes"] <= 2 * head_span + 3 * 4096):
-        failures.append("fast scan sampled_bytes = %d, expected about %d"
+    if fast["sampled_bytes"] != 2 * head_span:
+        failures.append("fast scan sampled_bytes = %d, expected exactly %d"
                         % (fast["sampled_bytes"], 2 * head_span))
     if fast["carved_files"] or os.path.isdir(os.path.join(fast["fast_dir"], "carved")):
         failures.append("fast scan carved files (it must not)")
@@ -501,6 +501,95 @@ def main():
     if raw_scan.same_local_volume(dev_path, "C:" + bs + "out"):
         failures.append("same_local_volume matched the wrong drive letter")
 
+    # regression (review B1): a hit that STRADDLES a slice boundary must be
+    # found by the slice that started it - contiguous slices previously lost
+    # max_len-1 bytes at every boundary, depending on parallelism
+    edge_img = os.path.join(tmpdir, "edge.img")
+    edge = bytearray(b"q" * 2003)
+    edge[1000:1003] = b".md"
+    with open(edge_img, "wb") as fh:
+        fh.write(bytes(edge))
+    saved_workers2 = raw_scan.PARALLEL_WORKERS
+    raw_scan.PARALLEL_WORKERS = 1                   # the sequential path
+    try:
+        left = raw_scan.scan(edge_img, md_only, CHUNK, os.path.join(tmpdir, "e1.txt"),
+                             None, show_progress=False, min_gap=0,
+                             start_offset=0, end_offset=1001)
+        right = raw_scan.scan(edge_img, md_only, CHUNK, os.path.join(tmpdir, "e2.txt"),
+                              None, show_progress=False, min_gap=0,
+                              start_offset=1001, end_offset=2003)
+    finally:
+        raw_scan.PARALLEL_WORKERS = saved_workers2
+    stitched_edge = sorted(h["offset"] for h in left["hits"] + right["hits"])
+    if stitched_edge != [1000]:
+        failures.append("boundary hit lost across slices: %r (expected [1000])"
+                        % stitched_edge)
+    if left["bytes_scanned"] + right["bytes_scanned"] != 2003:
+        failures.append("slice byte counts = %d + %d, expected 2003"
+                        % (left["bytes_scanned"], right["bytes_scanned"]))
+
+    # regression (review B2): a slice stopped by Ctrl+C is 'interrupted' at the
+    # offset the read reached - not 'complete' at the end of the source
+    prog_dir = os.path.join(tmpdir, "prog_runs")
+    prog_org = os.path.join(tmpdir, "prog_org")
+    os.makedirs(prog_dir)
+    os.makedirs(prog_org)
+    real_scan_fn = raw_scan.scan
+
+    def fake_interrupted_scan(target, patterns, chunk, results, carve_dir=None, *a, **kw):
+        return {"target": target, "total_size": 4096, "bytes_scanned": 2048,
+                "zero_bytes": 0, "elapsed": 0.01, "hits": [],
+                "counts": dict((p[0], 0) for p in patterns), "carved_files": 0,
+                "interrupted": True, "budget_hit": False,
+                "results_path": results, "carve_dir": carve_dir}
+
+    raw_scan.scan = fake_interrupted_scan
+    try:
+        stopped = raw_scan.run_progressive("stop.img", 4096, md_only, True,
+                                           prog_dir, prog_org, "2026-10-29 09:00:00")
+    finally:
+        raw_scan.scan = real_scan_fn
+    stopped_prov = raw_scan.read_provenance(prog_dir)
+    if stopped_prov.get("status") != "interrupted":
+        failures.append("interrupted slice recorded as %r" % (stopped_prov.get("status"),))
+    if stopped_prov.get("resume_offset") != 2048:
+        failures.append("interrupted slice resume_offset = %r, expected 2048"
+                        % (stopped_prov.get("resume_offset"),))
+    if not stopped.get("stopped_early"):
+        failures.append("run_progressive did not mark an interrupted slice stopped_early")
+
+    # regression (review B3): the carved window of a .txt hit keeps its exact
+    # bytes; the readable transcript is a SEPARATE file
+    bin_src = os.path.join(tmpdir, "bin.img")
+    raw_window = b"HEAD" + bytes([0xC7, 0xE1, 0xFF]) + b"TAIL" + bytes(32)
+    with open(bin_src, "wb") as fh:
+        fh.write(raw_window)
+    bin_carve = os.path.join(tmpdir, "bin_carved")
+    saved_smart = raw_scan.ENABLE_SMART_TEXT
+    raw_scan.ENABLE_SMART_TEXT = False
+    try:
+        bin_summary = raw_scan.scan(bin_src, [("Hermes marker (.txt)", b"HEAD", "txt", False)],
+                                    128, os.path.join(tmpdir, "bin_log.txt"), bin_carve,
+                                    carve_before=0, carve_after=32,
+                                    show_progress=False, min_gap=0)
+    finally:
+        raw_scan.ENABLE_SMART_TEXT = saved_smart
+    if not bin_summary["hits"]:
+        failures.append("the .txt regression fixture produced no hit")
+    else:
+        carved_path = bin_summary["hits"][0]["carved"]
+        with open(carved_path, "rb") as fh:
+            on_disk = fh.read()
+        expected_window = raw_window[:4 + 32]      # plen 4 + carve_after 32
+        if on_disk != expected_window:
+            failures.append("carved .txt window is not byte-exact: %r != %r"
+                            % (on_disk, expected_window))
+        readable = carved_path[:-4] + raw_scan.READABLE_SUFFIX
+        if os.path.abspath(readable) == os.path.abspath(carved_path):
+            failures.append("the readable copy overwrites the carved window")
+        if not os.path.isfile(readable):
+            failures.append("no separate readable transcript was written")
+
     # results log must contain every reported hit
     with open(results, "r", encoding="utf-8") as fh:
         log_text = fh.read()
@@ -525,6 +614,8 @@ def main():
     print("speed memory for the time estimate and the six-item main menu.")
     print("step 6 verified: JSON signature profiles (parse/load/refusals/profile scan),")
     print("output-root validation, UNC detection and the same-volume warning trigger.")
+    print("review regressions covered: boundary hits across slices, an interrupted slice")
+    print("recorded as interrupted, byte-exact .txt windows with a separate transcript.")
     shutil.rmtree(tmpdir, ignore_errors=True)
     sys.exit(0)
 

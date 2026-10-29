@@ -173,6 +173,9 @@ def filter_patterns_by_extension(patterns, extensions):
 # ----------------------------------------------------------------------
 
 PROFILE_FILE = "signature_profile.json"
+# Path of the profile loaded in this run (empty when the built-in set was used).
+# Kept so provenance can say which signature set produced the results.
+PROFILE_LAST_PATH = ""
 # Hex is written with spaces between bytes: "25 50 44 46 2D". A bare token
 # ("AC10", "25504446") is read as TEXT, which is what AutoCAD's "AC10" header
 # actually is - the tool must not guess.
@@ -222,6 +225,11 @@ def parse_signature_profile(data):
                     parse_hex_pattern(text)
                 except ValueError as exc:
                     raise ValueError("profile entry .%s: %s" % (ext, exc))
+            elif len(text) < 2:
+                # one character matches everything: it would fill the report with
+                # noise instead of finding a file
+                raise ValueError("profile entry .%s has a one-character value %r, "
+                                 "which is too short to search for" % (ext, text))
             kept.append(text)
         profile[ext] = kept
     if not profile:
@@ -389,6 +397,8 @@ def ask_profile_file():
         raise ValueError("no such profile file: %s" % path)
     profile, name = load_signature_profile(path)   # ValueError explains itself
     remember_path("profile", path)
+    global PROFILE_LAST_PATH
+    PROFILE_LAST_PATH = path
     print()
     print("Loaded %s" % os.path.basename(path))
     print("  %s" % profile_summary(profile, name))
@@ -1107,14 +1117,21 @@ def carve_window(f, abs_off, plen, total_size, carve_dir, label, ext, before, af
                     tf.write("sector         : %d\n" % (abs_off // SECTOR_SIZE))
             except OSError:
                 pass
-        # write a clean readable .txt copy for text windows
+        # Write a readable copy for text windows. It gets its OWN name: the raw
+        # window above may itself end in ".txt", and decoding with
+        # errors="replace" would destroy every non-UTF-8 byte (Windows-1256
+        # Arabic, high-bit binary) - and the raw copy is the only real evidence.
         if ext in ("md", "py", "json", "yaml", "yml", "env", "txt", "log",
                    "toml", "cfg", "ini", "csv", "sh", "bat", "ps1", "sql"):
             try:
                 text = data.decode("utf-8", errors="replace")
-                txt_path = os.path.join(carve_dir, "%s_0x%016X.txt" % (safe, abs_off))
-                with open(txt_path, "w", encoding="utf-8", errors="replace") as tf:
-                    tf.write(text)
+                txt_path = os.path.join(
+                    carve_dir, "%s_0x%016X%s" % (safe, abs_off, READABLE_SUFFIX))
+                if os.path.abspath(txt_path) == os.path.abspath(path):
+                    pass                     # cannot happen, never clobber
+                else:
+                    with open(txt_path, "w", encoding="utf-8", errors="replace") as tf:
+                        tf.write(text)
             except OSError:
                 pass
         return path
@@ -1327,7 +1344,10 @@ def _scan_range_worker(job):
                     hits.append({"label": label, "offset": abs_off,
                                  "sector": abs_off // SECTOR_SIZE,
                                  "carved": "", "ext": ext, "plen": plen})
-            scanned += len(chunk)
+            lo = max(start, next_off)
+            hi = min(end, next_off + len(chunk))
+            if hi > lo:
+                scanned += hi - lo
             next_off += len(chunk)
             if len(chunk) < chunk_size:
                 break
@@ -1509,20 +1529,9 @@ def scan(target, patterns, chunk_size, results_path, carve_dir=None,
                     del pending[:]
                 budget_hit = bool(found.get("budget_hit"))
                 zero_bytes += found.get("zero_bytes") or 0
-                # "bounded" = this call owns a SLICE of the source, not the
-                # whole source (the tail slice ends exactly at the source end,
-                # so start_offset has to be part of the test)
-                bounded = (start_offset > 0
-                           or (end_offset is not None and total_size
-                               and end_offset < total_size))
-                if budget_hit or bounded:
-                    # honest byte count for a partial or bounded pass: only the
-                    # ranges that actually finished were read
-                    measured = found.get("scanned") or 0
-                    span = (end_offset - start_offset) if end_offset else measured
-                    scanned = min(measured, span) if span else measured
-                else:
-                    scanned = total_size
+                # the workers count only the bytes inside their own range, so
+                # this is exact for a full pass, a slice and a partial one
+                scanned = found.get("scanned") or total_size
                 use_parallel = True
             except Exception as exc:      # a broken pool must never lose the scan
                 log("parallel phase failed: %s - falling back to one process" % exc)
@@ -1539,16 +1548,27 @@ def scan(target, patterns, chunk_size, results_path, carve_dir=None,
             f.seek(aligned_start)
             next_off = aligned_start
 
+        # A bounded scan must read PAST end_offset by the longest signature: a
+        # hit that starts just before the boundary only completes a few bytes
+        # later, and the next range would reject it as "before my start" - that
+        # is a dead band of max_len-1 bytes at every slice boundary.
+        if end_offset is None:
+            read_limit = None
+        elif total_size:
+            read_limit = min(end_offset + max_len, total_size)
+        else:
+            read_limit = end_offset + max_len
+
         try:
             while not use_parallel:
-                if end_offset is not None and next_off >= end_offset:
+                if read_limit is not None and next_off >= read_limit:
                     break
                 if deadline is not None and time.time() > deadline:
                     budget_hit = True
                     interrupted = True
                     break
-                to_read = (chunk_size if end_offset is None
-                           else min(chunk_size, end_offset - next_off))
+                to_read = (chunk_size if read_limit is None
+                           else min(chunk_size, read_limit - next_off))
                 chunk = read_exact(f, to_read)
                 if not chunk:
                     break
@@ -1576,7 +1596,11 @@ def scan(target, patterns, chunk_size, results_path, carve_dir=None,
                 for label, ext, plen, abs_off in match_block(hay, hay_low, pat_list,
                                                              base, carry_floor,
                                                              last_hit, min_gap):
+                    # each range owns [start_offset, end_offset): the over-read
+                    # above finds boundary hits, and they belong to the NEXT range
                     if abs_off < start_offset:
+                        continue
+                    if end_offset is not None and abs_off >= end_offset:
                         continue
                     sector = abs_off // SECTOR_SIZE
                     hits.append({"label": label, "offset": abs_off,
@@ -1594,7 +1618,15 @@ def scan(target, patterns, chunk_size, results_path, carve_dir=None,
                     del pending[:]
                 log_file.flush()
 
-                scanned += len(chunk)
+                # count only the bytes inside this range: the pre-roll before
+                # start_offset and the over-read after end_offset are not part
+                # of what this pass was asked to scan
+                lo = max(start_offset, next_off)
+                hi = next_off + len(chunk)
+                if end_offset is not None:
+                    hi = min(hi, end_offset)
+                if hi > lo:
+                    scanned += hi - lo
                 next_off += len(chunk)
                 update_progress()
 
@@ -2108,7 +2140,7 @@ def find_recoveries(roots=None, depth=1):
 
 
 def provenance_payload(target, total, summary, patterns, case_sensitive,
-                       started_at, progress=None):
+                       started_at, progress=None, profile="", profile_name=""):
     """The provenance.json body for one run (Section 1)."""
     payload = {
         "tool": "fixformat raw_scan.py",
@@ -2126,6 +2158,9 @@ def provenance_payload(target, total, summary, patterns, case_sensitive,
         "carve_before": CARVE_BEFORE,
         "carve_after": CARVE_AFTER,
         "chunk_size": CHUNK_SIZE,
+        # empty when the built-in signature set was used (Section 7)
+        "profile": profile or "",
+        "profile_name": profile_name or "",
     }
     if summary:
         payload.update({
@@ -2340,7 +2375,7 @@ def ask_resume(force=False):
 
 def run_progressive(target, total, patterns, case_sensitive, recovered_dir,
                     organized_dir, started_at, resume_from=0, tag="",
-                    percent=PROGRESSIVE_PERCENT):
+                    percent=PROGRESSIVE_PERCENT, profile="", profile_name=""):
     """
     Section 4: scan `target` in slices. After every slice the carved data is
     organized, provenance.json is updated with the offset to resume from, and
@@ -2382,13 +2417,21 @@ def run_progressive(target, total, patterns, case_sensitive, recovered_dir,
             break
         merge_summaries(combined, part)
 
-        # organize this slice's files, then record where to continue from
+        # organize this slice's files, then record where to continue from.
+        # scan() catches Ctrl+C itself and returns normally with interrupted
+        # set, so this - not an exception - is what "the user stopped" looks
+        # like: the slice ends where the read stopped, not at its planned end.
+        slice_interrupted = bool(part.get("interrupted"))
         organize_output(part, recovered_dir, organized_dir)
-        combined["resume_offset"] = end if end is not None else (
-            combined["bytes_scanned"] + start)
-        finished = end is None or (total and end >= total)
+        if slice_interrupted:
+            combined["resume_offset"] = start + int(part.get("bytes_scanned") or 0)
+        else:
+            combined["resume_offset"] = end if end is not None else (
+                combined["bytes_scanned"] + start)
+        finished = (not slice_interrupted) and (end is None or (total and end >= total))
         prov = provenance_payload(target, total, combined, patterns,
-                                  case_sensitive, started_at)
+                                  case_sensitive, started_at,
+                                  profile=profile, profile_name=profile_name)
         prov.update({"run_id": tag, "recovered_dir": recovered_dir,
                      "organized_dir": organized_dir,
                      "resume_offset": combined["resume_offset"],
@@ -2399,6 +2442,12 @@ def run_progressive(target, total, patterns, case_sensitive, recovered_dir,
         print("Slice done: %d hits so far, %d files carved, saved at offset %s"
               % (len(combined["hits"]), combined["carved_files"],
                  fmt_bytes(combined["resume_offset"])))
+        if slice_interrupted:
+            print("Stopped by the user inside this slice - it is recorded as")
+            print("interrupted at %s, so it can be continued from there."
+                  % fmt_bytes(combined["resume_offset"]))
+            combined["stopped_early"] = True
+            break
         if finished:
             print("The whole source has been scanned.")
             break
@@ -2412,7 +2461,7 @@ def run_progressive(target, total, patterns, case_sensitive, recovered_dir,
     # final organized view + summary over everything found so far
     organize_output(combined, recovered_dir, organized_dir)
     prov = provenance_payload(target, total, combined, patterns, case_sensitive,
-                              started_at)
+                              started_at, profile=profile, profile_name=profile_name)
     prov.update({"run_id": tag, "recovered_dir": recovered_dir,
                  "organized_dir": organized_dir,
                  "resume_offset": combined["resume_offset"],
@@ -2649,19 +2698,26 @@ def fast_report_lines(summary, sampled_bytes, ranges, projection, names):
     if names:
         lines.append("  sample names  : %s"
                      % ", ".join(name for name, _ in names[:10]))
-    if projection.get("usable"):
+    sample_too_small = bool(summary.get("budget_hit")) and (
+        sampled_bytes < max(SECTOR_SIZE, int((summary.get("total_size") or 0) / 100)))
+    if projection.get("usable") and not sample_too_small:
         lines.append("")
         lines.append("  PROJECTION if the rest of the source has the same density:")
         lines.append("    hits on the whole source : about %d"
                      % projection["projected_hits"])
-        lines.append("    recoverable data        : about %s (window %s per hit,"
-                     " %s per signature)"
+        lines.append("    carved-window bytes     : about %s (window %s per hit,"
+                     " %s per signature; smart text can grow a window)"
                      % (fmt_bytes(projection["projected_bytes"]),
                         fmt_bytes(CARVE_BEFORE + CARVE_AFTER),
                         CARVE_LIMIT if CARVE_LIMIT else "no limit"))
     lines.append("")
     lines.append("-" * 78)
-    if not hits:
+    if sample_too_small:
+        lines.append("RECOMMENDATION: the %s budget ran out after %s of the source -"
+                     % (fmt_hms(FAST_SCAN_BUDGET), fmt_bytes(sampled_bytes)))
+        lines.append("  that is too little to judge anything. Raise FAST_SCAN_BUDGET or")
+        lines.append("  run the full scan (menu option 2). This is NOT a wiped-disk verdict.")
+    elif not hits:
         lines.append("RECOMMENDATION: no signatures found in the sampled regions.")
         if zero_pct >= 90.0:
             lines.append("  %.1f%% of the sampled bytes are zeros - that is the pattern of a"
@@ -2685,7 +2741,7 @@ def fast_report_lines(summary, sampled_bytes, ranges, projection, names):
 
 
 def run_fast_scan(target, total, patterns, case_sensitive, budget=None,
-                  percent=None, base_dir=None):
+                  percent=None, base_dir=None, profile=None, profile_name=""):
     """
     Section 5: read the first and last `percent` of the source inside a hard
     time budget, then report counts, sample names and a projection. No carved
@@ -2751,7 +2807,10 @@ def run_fast_scan(target, total, patterns, case_sensitive, budget=None,
     summary["report_path"] = report_path
 
     prov = provenance_payload(target, total, summary, patterns, case_sensitive,
-                              datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                              datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                              profile=(PROFILE_LAST_PATH if profile is None
+                                       else profile) or "",
+                              profile_name=profile_name or "")
     prov.update({"mode": "fast scan",
                  "sampled_bytes": sampled,
                  "ranges": [[start, end] for start, end in ranges],
@@ -2829,7 +2888,10 @@ def run_fast_flow(target, total):
     print("Press Ctrl+C to stop early - everything found so far is kept.")
     print("-" * 78)
     try:
-        summary = run_fast_scan(target, total, patterns, CASE_SENSITIVE)
+        summary = run_fast_scan(
+            target, total, patterns, CASE_SENSITIVE,
+            profile=(PROFILE_LAST_PATH if profile is not None else ""),
+            profile_name=profile_name)
     except PermissionError:
         print("\nERROR: access denied.")
         print("Raw device reads require administrator / SYSTEM rights.")
@@ -2937,6 +2999,7 @@ def run_search_flow(target, total, mode="full"):
         print("and run the tool again.")
         sys.exit(2)
 
+    profile_path = PROFILE_LAST_PATH if profile is not None else ""
     if profile is not None:
         print()
         print("The extension menu is skipped: the profile IS the filter.")
@@ -3020,7 +3083,13 @@ def run_search_flow(target, total, mode="full"):
 
     # ---- run folders (Section 1 + 2): one pair per run, provenance-stamped ----
     started_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    recovered_dir, organized_dir, run_id = make_run_dirs(work_root, target, total)
+    try:
+        recovered_dir, organized_dir, run_id = make_run_dirs(work_root, target, total)
+    except OSError as exc:
+        print()
+        print("ERROR: cannot create the run folders in %s (%s)" % (work_root, exc))
+        print("Nothing was scanned. Pick a writable output root and run again.")
+        sys.exit(1)
     results_path = os.path.join(recovered_dir, RESULTS_FILE)
     carve_dir = os.path.join(recovered_dir, "carved") if ENABLE_CARVING else None
     print("results folder  : %s" % recovered_dir)
@@ -3030,7 +3099,9 @@ def run_search_flow(target, total, mode="full"):
             print("Slices of %d%% with a checkpoint after each one." % PROGRESSIVE_PERCENT)
             summary = run_progressive(target, total, patterns, case_sensitive,
                                       recovered_dir, organized_dir, started_at,
-                                      tag=run_id)
+                                      tag=run_id,
+                                      profile=profile_path or "",
+                                      profile_name=profile_name if profile else "")
         else:
             summary = scan(target, patterns, CHUNK_SIZE, results_path, carve_dir,
                            CARVE_BEFORE, CARVE_AFTER, min_gap=MIN_GAP,
@@ -3070,7 +3141,9 @@ def run_search_flow(target, total, mode="full"):
 
     # provenance (Section 1): one JSON next to the extracted data
     provenance = provenance_payload(target, total, summary, patterns,
-                                    case_sensitive, started_at)
+                                    case_sensitive, started_at,
+                                    profile=profile_path or "",
+                                    profile_name=profile_name if profile else "")
     provenance["run_id"] = run_id
     provenance["recovered_dir"] = recovered_dir
     provenance["organized_dir"] = organized_dir
@@ -3080,9 +3153,17 @@ def run_search_flow(target, total, mode="full"):
     provenance["resume_offset"] = int(summary.get("bytes_scanned") or total or 0)
     write_provenance(recovered_dir, provenance)
 
-    # organized browsable output (Section 2)
-    moved, index_path, summary_path = organize_output(
-        summary, recovered_dir, organized_dir, names)
+    # organized browsable output (Section 2). If it fails (read-only root, disk
+    # full, share gone) the carved files are still in recovered_dir - say so
+    # instead of dying with a traceback after hours of scanning.
+    try:
+        moved, index_path, summary_path = organize_output(
+            summary, recovered_dir, organized_dir, names)
+    except OSError as exc:
+        print()
+        print("WARNING: could not build the organized folder (%s)." % exc)
+        print("The recovered files are safe in: %s" % recovered_dir)
+        moved, index_path, summary_path = 0, "", ""
     carved_count = carved_bytes = 0
     for cur_dir, _dirs, files in os.walk(os.path.join(organized_dir, "by_extension")):
         for name in files:
@@ -3560,7 +3641,9 @@ def resume_flow(resumed):
                                resume_case, recovered_dir, organized_dir,
                                resume_prov.get("started") or "",
                                resume_from=resume_offset,
-                               tag=resume_prov.get("run_id", ""))
+                               tag=resume_prov.get("run_id", ""),
+                               profile=resume_prov.get("profile") or "",
+                               profile_name=resume_prov.get("profile_name") or "")
     print()
     print("Recovery updated: %d hits, %d files carved, resume offset %s"
           % (len(combined["hits"]), combined["carved_files"],
@@ -3746,6 +3829,9 @@ CARVE_DIR = "recovered"
 CARVE_BEFORE = 4096            # bytes kept before the hit
 CARVE_AFTER = 64 * 1024        # bytes kept after the hit
 CARVE_LIMIT = 100              # max carved files per pattern (0 = unlimited)
+# Suffix of the readable UTF-8 transcript written next to a text window. It is
+# NOT the carved data: the .txt bytes on disk are the recovered truth.
+READABLE_SUFFIX = "_readable.txt"
 # Phase 2 reads the source forward in blocks of this size and serves every carve
 # window from the block in memory (one read per 4 MB instead of a seek per hit).
 CARVE_BLOCK_SIZE = 4 * 1024 * 1024
