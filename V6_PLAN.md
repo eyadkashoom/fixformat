@@ -590,6 +590,7 @@ CREATE TABLE plan (id INTEGER PRIMARY KEY, run_id INTEGER, rule TEXT,
 | D11 | Cap behaviour: fixed rule or asked at runtime? | **APPROVED: asked at runtime**, three answers (9d), recorded in `run.cap_policy` |
 | D12 | One mode or two (`extract as we go` / `report first`)? | **APPROVED: two modes** (9d); report-first needs no output space and always ends at the planner |
 | D13 | Stop/resume available in every stage? | **APPROVED: always** - `P` pauses, `Q` checkpoints, both modes resume |
+| D14 | Any code path written for one specific disk or one user's situation? | **APPROVED: no.** The tool serves every case: the FVE gate, the modes, the caps and the planner are general features with tests on synthetic images, never branches for a single customer's disk |
 | D3 | Fragmented assembly scope | JPEG, PNG, PDF, ZIP/OOXML, SQLite; sequential + BGC, no SmartCarving |
 | D4 | Direct I/O option | yes, as an opt-in, kept only if the real-image measurement shows no slowdown |
 | D5 | Output budget per run | **APPROVED by the user**: `OUTPUT_CAP_GB = 100`, `OUTPUT_CAP_PERCENT = 25` of the destination's free space (whichever is smaller), `OUTPUT_CAP_FILES = 200000`, `FREE_RESERVE_MB = 2048`. Behaviour at the cap is asked at runtime, not fixed (D11). |
@@ -601,7 +602,7 @@ CREATE TABLE plan (id INTEGER PRIMARY KEY, run_id INTEGER, rule TEXT,
 
 | Step | Work | Why here |
 |---|---|---|
-| 0 | `v6/` from `v5/`, `VERSION = "6.0"`, v5 selftest green in `v6/` | a green base before any change |
+| 0 | **DONE (2559fb0)**: `v6/` from `v5/`, `VERSION = "6.0"`, v5 selftest green in `v6/` | a green base before any change |
 | 1 | `audit.txt` + the profile `footer`/`max_size` fields | small, independent, immediately useful |
 | 2 | Validators for JPEG/PNG/PDF/ZIP + a `confidence` field, attached to carve results | kills the noise class; prerequisite for everything in Section 8 |
 | 3 | ~~The MFT survival probe~~ **DONE** (0b): the volume is BitLocker, so the answer is 'unreadable', not 'clean' | measurement complete |
@@ -609,7 +610,7 @@ CREATE TABLE plan (id INTEGER PRIMARY KEY, run_id INTEGER, rule TEXT,
 | 4 | Triage pass: MFT + `$Bitmap` + `$UsnJrnl:$J`, name map, direct recovery | the biggest win if the probe passes |
 | 4a | Walk the MFT to `$Recycle.Bin` and `System Volume Information`; parse `$I`/`$R`; probe for VSS stores | cheap, and it hands back whole named files before any carving |
 | 4b | If the probe finds stores: a VSS reader (catalog + 16 KiB block map) | high effort, decide on the probe result |
-| 4c | The run database (9b), the two modes and the recovery plan (9d), `report.md`/`.csv` | every later feature writes into it, so it lands before assembly |
+| 4c | The run database: **module DONE (2559fb0, 229 assertions)**, still to do - wire it into `scan()`, the two modes, the recovery-plan screen, and `report.md`/`.csv` from the run folder | every later feature writes into it, so it lands before assembly |
 | 5 | Adaptive parallelism (1 worker on zero-heavy ranges, 8 on data) | measured penalty removed |
 | 6 | Sequential assembly, then BGC, behind validators | the fragmented-file feature |
 | 7 | Direct I/O option, measured | bounded gain, system responsiveness |
