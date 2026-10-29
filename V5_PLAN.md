@@ -506,7 +506,7 @@ before the fixes landed - six tests, all red then, all green now).
 | S6 a resume rebuilt signatures from label names only | provenance had `signature_labels` and no bytes | **fixed**: `signature_bytes` + `patterns_from_provenance()`; a renamed label keeps its stored bytes, old provenance warns, unreadable bytes refuse the resume |
 | S7 a resume overwrote the folder's totals with the last slice's | `combined` started empty and was written to the same provenance | **fixed**: `cumulative_totals()` + `totals=` on `provenance_payload`; probe: 3 slices -> `hits 3`, resume -> `hits 4` (not 1), `bytes_scanned` = source size, `status complete` |
 | S8 fast and full throughput shared one `scan_speed.json` key | one key `image` | **fixed**: keyed `image:fast` / `image:full` with a fallback to the old key; a real run wrote `{"image:full": 219041.0}` |
-| S10 one worker error discarded every finished range and re-read from byte 0 | `except Exception: del hits[:]` | **fixed**: each worker reports its range, the parent keeps finished ones and rescans only the missing ones in-process; the worker's read window is clamped to the device size. Clamp and job id are tested; the fallback branch is reasoned, not exercised (a worker failure cannot be injected across the process boundary) |
+| S10 one worker error discarded every finished range and re-read from byte 0 | `except Exception: del hits[:]` | **fixed**: each worker reports its range, the parent keeps finished ones and rescans only the missing ones in-process; the worker's read window is clamped to the device size. Clamp and job id are tested, and the fallback branch has since fired for real (a spawn bootstrap failure in a probe script: it caught the error, resaid only the missing ranges and finished the scan) |
 | S11 `CARVE_LIMIT` reset per slice | 6 slices x limit | **fixed**: `scan(carved_counts=...)` + one dict per run; probe: 12 hits over 6 slices -> 2 files |
 
 Remaining caveat on S9: the fast scan's own `fastscan_*` folder is still created outside
@@ -554,14 +554,29 @@ fixture with one hit (3 s, so CI no longer needs a 6 minute timeout).
 
 ## Next step
 
-The release is ready to tag: v1-v5 selftests green (6 s total), the independent
-regress suite green, the review closed, `v5/REAL_MEDIA_v5.md` and
-`v5/RELEASE_QA_v5.0.0.md` in the tree, `v5.zip` built next to `python-embed.zip`.
+v5.0.0 is tagged and released (assets `v5.zip` + `python-embed.zip`, CI green on
+`v1..v5`). `main` carries one 5.1 change already:
 
-Remaining, in order:
+* **the `":` JSON needle is gone** (5.1). It was two bytes and produced 8,675 of
+  8,899 hits on the real image - noise, not JSON. Three markers (`": true`,
+  `": false`, `": null`, each in UTF-8 and UTF-16LE) replace it: measured on a
+  256 MiB slab of the same image the removed needle alone accounted for **557
+  hits (90.1% of everything reported with the old set)** and the new markers found
+  **0** there, while a fixture containing real JSON is found 3/3 at the exact
+  offsets. Pattern count 81 -> 85.
 
-1. `git tag -a v5.0.0`, `gh release create v5.0.0 v5.zip python-embed.zip`;
-2. tick the checklist in `v5/RELEASE_NOTES_v5.0.0.md` and paste its README block;
-3. open items for 5.1: the `":` JSON signature is pure noise on real data and
-   should be replaced, auto-parallel should avoid zero-heavy regions, and the
-   parallel fallback branch is still reasoned rather than exercised.
+Also settled: the S10 parallel-fallback branch is **no longer unexercised**. A
+probe script without a `if __name__ == "__main__":` guard made the spawn pool
+fail with the bootstrap error, `parallel_phase1` caught it, printed
+`A parallel worker failed (...) - rescanning the remaining ranges in this
+process.` and completed the scan sequentially. That is the branch firing for
+real, on a 476.9 GiB source.
+
+Open for 5.1:
+
+1. auto-parallel should not pay the measured 25-35% penalty on zero-heavy
+   regions (9.6 s on 4 workers vs 7.1 s on 1 for an all-zero GiB);
+2. consider more markers that are statistics rather than guesses - the real
+   image showed that short needles dominate a report and bury the evidence;
+3. the fast scan needs a coverage/budget trade-off that reflects 25 MB/s
+   (0.79% of a 476.9 GiB image in 120 s; 10% needs ~26 min).

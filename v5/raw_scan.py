@@ -4230,7 +4230,12 @@ TARGET_SIGNATURES = {
     "Python def (.py)": "def ",
     "Environment (.env)": "API_KEY=",
     "YAML Config (.yaml)": "agent:",
-    "JSON Data (.json)": '":',
+    # 5.1: the old needle was the two bytes '":' - on a real 476.9 GiB image it
+    # produced 8,675 of 8,899 hits, i.e. it was matching noise, not JSON. These
+    # three markers are long enough to mean something in a real file.
+    "JSON boolean true (.json)": '": true',
+    "JSON boolean false (.json)": '": false',
+    "JSON null (.json)": '": null',
     "Markdown heading LF (.md)": "\n# ",
     "Markdown heading CRLF (.md)": "\r\n# ",
     # --- file extension strings ---
