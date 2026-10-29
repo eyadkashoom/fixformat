@@ -1974,6 +1974,98 @@ def source_drive_letter(target):
     return path_drive_letter(text)
 
 
+class STORAGE_DEVICE_NUMBER(ctypes.Structure):
+    """Windows IOCTL_STORAGE_GET_DEVICE_NUMBER reply (Section 12)."""
+    _fields_ = [("DeviceType", ctypes.c_ulong),
+                ("DeviceNumber", ctypes.c_ulong),
+                ("PartitionNumber", ctypes.c_ulong)]
+
+
+IOCTL_STORAGE_GET_DEVICE_NUMBER = 0x2D1080
+
+
+def physical_disk_number(path):
+    """
+    The Windows PHYSICAL disk number behind a path, or None when unknown.
+    A raw device path gives its own number; a drive letter gives the disk that
+    letter lives on; a network share or a foreign path gives None. Two
+    different drive letters can be the same physical disk, which is the whole
+    point of Section 12.
+    """
+    text = str(path or "")
+    bs = chr(92)
+    device_prefix = bs + bs + "." + bs + "physicaldrive"
+    if text.lower().startswith(device_prefix):
+        tail = text[len(device_prefix):]
+        return int(tail) if tail.isdigit() else None
+    if not IS_WINDOWS:
+        return None
+    letter = path_drive_letter(text)
+    if not letter:
+        return None
+    device = bs + bs + "." + bs + letter.upper() + ":"
+    try:
+        kernel32 = ctypes.windll.kernel32
+        kernel32.CreateFileW.restype = ctypes.c_void_p
+        handle = kernel32.CreateFileW(ctypes.c_wchar_p(device), 0, 3, None, 3, 0, None)
+        if not handle or handle == ctypes.c_void_p(-1).value:
+            return None
+        try:
+            info = STORAGE_DEVICE_NUMBER()
+            returned = ctypes.c_ulong(0)
+            ok = kernel32.DeviceIoControl(handle, IOCTL_STORAGE_GET_DEVICE_NUMBER,
+                                          None, 0, ctypes.byref(info),
+                                          ctypes.sizeof(info), ctypes.byref(returned),
+                                          None)
+            return int(info.DeviceNumber) if ok else None
+        finally:
+            kernel32.CloseHandle(ctypes.c_void_p(handle))
+    except Exception:
+        return None
+
+
+def same_physical_disk(source, path):
+    """
+    True / False / None (unknown) for "is `path` on the source's own disk".
+    Section 12: writing recovered data onto the disk being recovered can
+    overwrite the very data the scan is looking for, and a second drive letter
+    on the same physical disk is still that disk.
+    """
+    src = physical_disk_number(source)
+    dst = physical_disk_number(path)
+    if src is None or dst is None:
+        return None
+    return src == dst
+
+
+def confirm_same_disk(target, root):
+    """
+    Section 12: a destination on the source's physical disk is REFUSED unless the
+    user types the override. Returns True when `root` may be used.
+    """
+    verdict = same_physical_disk(target, root)
+    if verdict is None:
+        verdict = same_local_volume(target, root)
+    if not verdict:
+        return True
+    src_no = physical_disk_number(target)
+    dst_no = physical_disk_number(root)
+    print()
+    print("REFUSED - THAT FOLDER IS ON THE SAME PHYSICAL DISK AS THE SOURCE")
+    if src_no is not None and dst_no is not None:
+        print("  source disk : PhysicalDrive%d" % src_no)
+        print("  this folder : PhysicalDrive%d" % dst_no)
+    print("  Writing recovered data there can overwrite the very data this scan")
+    print("  is trying to recover. Use a different physical disk or a share.")
+    print("  (A different drive letter on the same disk does not help - that is")
+    print("   exactly what this check catches.)")
+    typed, ok = _ask("Type YES (in capitals) to use it anyway: ")
+    if ok and typed.strip() == "YES":
+        print("Overriding the refusal at your explicit request.")
+        return True
+    return False
+
+
 def same_local_volume(target, path):
     """True when `path` is on the same drive letter as a volume target."""
     src = source_drive_letter(target)
@@ -2019,11 +2111,9 @@ def ask_output_root(target, default_root):
     if OUTPUT_ROOT.strip():
         usable, message = validate_output_root(OUTPUT_ROOT.strip())
         if usable:
-            if same_local_volume(target, message):
-                print()
-                print("WARNING: OUTPUT_ROOT is on the SAME disk as the source (%s:)."
-                      % source_drive_letter(target).upper())
-                print("Writing there can destroy the data this scan is looking for.")
+            if not confirm_same_disk(target, message):
+                print("Falling back to the script folder: %s" % default_root)
+                return default_root
             print("Output root     : %s (OUTPUT_ROOT)" % message)
             return message
         print()
@@ -2053,14 +2143,12 @@ def ask_output_root(target, default_root):
             return default_root
         usable, message = validate_output_root(typed)
         if usable:
-            if same_local_volume(target, message):
-                print()
-                print("WARNING: that folder is on the SAME disk as the source (%s:)."
-                      % source_drive_letter(target).upper())
-                print("Writing there can destroy the data this scan is looking for.")
-                confirm, ok_confirm = _ask("Use it anyway? [y/N]: ")
-                if not ok_confirm or confirm.strip().lower() not in ("y", "yes"):
-                    continue
+            if not confirm_same_disk(target, message):
+                retry, ok_retry = _ask("Try another folder? [Y/n]: ")
+                if not ok_retry or retry.strip().lower() in ("n", "no"):
+                    print("Writing next to this script instead: %s" % default_root)
+                    return default_root
+                continue
             print("Output root     : %s" % message)
             remember_path("recovered", message)
             return message
@@ -2103,12 +2191,9 @@ def ask_save_location(work_dir, target=""):
     if os.path.abspath(root) == os.path.abspath(work_dir):
         print("That is already the folder the results are in.")
         return ""
-    if same_local_volume(target, root):
-        print()
-        print("WARNING: that folder is on the SAME disk as the source (%s:)."
-              % source_drive_letter(target).upper())
-        print("Writing there can destroy the data this scan is looking for. An")
-        print("external disk or a share is safe; this move is done as you asked.")
+    if not confirm_same_disk(target, root):
+        print("Results kept in: %s" % work_dir)
+        return ""
     remember_path("recovered", root)
     return root
 
@@ -2938,7 +3023,10 @@ def run_fast_scan(target, total, patterns, case_sensitive, budget=None,
     budget = FAST_SCAN_BUDGET if budget is None else budget
     percent = FAST_SCAN_PERCENT if percent is None else percent
     base_dir = base_dir or SCRIPT_DIR
-    fast_dir, _tag = make_fast_scan_dir(base_dir, target, total)
+    try:
+        fast_dir, _tag = make_fast_scan_dir(base_dir, target, total)
+    except OSError as exc:
+        raise ValueError("cannot create the fast-scan folder in %s: %s" % (base_dir, exc))
     results_path = os.path.join(fast_dir, RESULTS_FILE)
     ranges = fast_scan_ranges(total, percent)
     started = time.time()
@@ -3083,6 +3171,10 @@ def run_fast_flow(target, total):
         print("Raw device reads require administrator / SYSTEM rights.")
         print("Re-open the command prompt as Administrator and retry.")
         sys.exit(3)
+    except ValueError as exc:
+        print("\nERROR: %s" % exc)
+        print("Nothing was scanned. Point the tool at a writable folder.")
+        sys.exit(1)
     except OSError as exc:
         print("\nERROR: %s" % exc)
         sys.exit(1)

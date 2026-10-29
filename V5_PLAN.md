@@ -481,6 +481,9 @@ and mmap (13.6) only pays on repeated scans of the same image.
 
 | 6 | **done** | **Sections 7 + 8.** Profile: `parse_signature_profile` / `load_signature_profile` / `profile_patterns` / `profile_summary`, reached from STEP 2 of both the full and the fast scan through a numbered `.json` picker; hex is spaces-between-bytes and a bare token is TEXT (AutoCAD's `AC10` really is text), every malformed entry raises a message that names the key and **stops the run** instead of silently scanning with the built-in set. Output root: `validate_output_root` (creates the folder and proves it writable with a probe file), `ask_output_root` before the plan + `OUTPUT_ROOT` config, `same_local_volume` / `source_drive_letter` for the non-blocking same-disk warning, and a local fallback when the share is unusable. Verified by scripted runs: a `.md`+`.pdf` profile produced `recovered_*` inside the chosen root with 3 profile signatures in `provenance.json` and nothing written next to the script; a broken profile exited 2 with `SIGNATURE ERROR: profile entry .md has no signatures`; an unusable root printed `CANNOT USE THAT FOLDER` and the scan completed next to the script. Selftest covers parse/load/refusals, a profile-driven scan, root validation, UNC detection and the same-volume trigger. Gap kept for step 7/8: a share that disappears **mid-run** is caught by the final move (results stay local), not detected during the scan |
 
+| 7 | **partly done** | **Section 12 done**: `physical_disk_number()` (IOCTL_STORAGE_GET_DEVICE_NUMBER), `same_physical_disk()` and `confirm_same_disk()` now REFUSE a destination on the source's own physical disk and require a typed `YES` override; measured on real hardware: C: = PhysicalDrive0, F: = PhysicalDrive1, and a device path compared to its own letter resolves to the same disk. The fast-scan folder is guarded too (S9). **Section 13.6 mmap measured and REJECTED**: on a 96 MB fixture, raw reads run 200-400 MB/s and mmap slicing 300-500 MB/s, but a full phase 1 runs at only 6-11 MB/s, so 96-98% of the time is the pattern matcher, not the read. mmap would change nothing, exactly like the 13.2 rejection. **Open: the 13.8 real-media numbers** (in progress on the 476.9 GiB image, `v5/REAL_MEDIA_v5.md`) |
+| 8 | **next** | tag `v5.0.0`, release with `python-embed.zip`, tick the release checklist in `v5/RELEASE_NOTES_v5.0.0.md` |
+
 ## Review pass (independent agent on commit `802df9f`)
 
 `v5/REVIEW_v5_steps0-5.md` (kept in the repo) found three blockers and eleven
@@ -516,16 +519,15 @@ move fails.
 
 ## Next step
 
-Steps 0-6 are done and the whole review is closed. **Step 7 is next**:
+Everything except the release itself is closed or in flight. Remaining:
 
-1. Section 13.6 mmap for image files;
-2. Section 13.8 - the first measurement on a fixture that is not a toy: the
-   harness is `v5/bench_step7.py` (written by a second agent), which reports
-   phase-1-only, carving, sequential vs parallel, fast scan and a two-slice
-   progressive run on one 64 MB fixture, and writes JSON for comparison;
-3. only then the numbers in this plan can stop saying "synthetic fixture".
+1. `v5/REAL_MEDIA_v5.md` - the first real-media numbers, measured on the user's
+   interrupted 476.9 GiB image (F:\hard512);
+2. `v5/RELEASE_QA_v5.0.0.md` - the release gate, written by an independent agent;
+3. `v5/RELEASE_NOTES_v5.0.0.md` - notes + the README block;
+4. the release: tag `v5.0.0`, attach `python-embed.zip`, tick the checklist.
 
-Then step 8: the same-physical-disk refusal (today it warns), tag `v5.0.0`, the
-release with `python-embed.zip`.
-
-Nothing in v5 has ever run against a real disk or a real image file.
+Known and accepted limits for 5.0.0: carving cost on text-heavy media (bounded
+now by `SMART_TEXT_MAX_EXTRA` and `ENABLE_READABLE_COPY`), the parallel
+fallback branch is reasoned but not exercised, and no v5 build has read a real
+`\\.\PhysicalDriveN` device (only a real image file).

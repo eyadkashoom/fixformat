@@ -796,6 +796,58 @@ def main():
         if transcripts:
             failures.append("ENABLE_READABLE_COPY=False still wrote %r" % (transcripts,))
 
+    # section 12: a destination on the source's own PHYSICAL disk is refused
+    bs12 = chr(92)
+    dev_form = bs12 + bs12 + "." + bs12 + "PhysicalDrive0"
+    if raw_scan.physical_disk_number(dev_form) != 0:
+        failures.append("physical_disk_number did not read the device number")
+    unc_path = bs12 + bs12 + "server" + bs12 + "share"
+    if raw_scan.physical_disk_number(unc_path) is not None:
+        failures.append("physical_disk_number invented a disk for a share")
+    if raw_scan.IS_WINDOWS:
+        here = os.path.abspath(tmpdir)
+        letter = raw_scan.path_drive_letter(here)
+        if letter:
+            own = raw_scan.physical_disk_number(here)
+            if not isinstance(own, int):
+                failures.append("physical_disk_number returned %r for a local path" % (own,))
+            if raw_scan.same_physical_disk(os.path.join(here, "a.img"),
+                                           os.path.join(here, "out")) is not True:
+                failures.append("same_physical_disk missed the same local disk")
+    # the refusal needs an explicit override, and a refusal falls back.
+    # physical_disk_number is faked so the test does not depend on which disk
+    # this machine happens to mount where.
+    saved_ask12 = raw_scan._ask
+    saved_pdn = raw_scan.physical_disk_number
+    raw_scan.physical_disk_number = lambda path: (7 if "same" in str(path)
+                                                 else (3 if "other" in str(path)
+                                                       else None))
+    try:
+        same_pair = ("same_source.img", "same_dest")
+        other_pair = ("same_source.img", "other_dest")
+        raw_scan._ask = lambda prompt="": ("no", True)
+        if raw_scan.confirm_same_disk(*same_pair):
+            failures.append("confirm_same_disk accepted the same disk without an override")
+        raw_scan._ask = lambda prompt="": ("YES", True)
+        if not raw_scan.confirm_same_disk(*same_pair):
+            failures.append("confirm_same_disk ignored the explicit YES override")
+        raw_scan._ask = lambda prompt="": ("y", True)
+        if not raw_scan.confirm_same_disk(*other_pair):
+            failures.append("confirm_same_disk refused a different physical disk")
+        if not raw_scan.confirm_same_disk("unknown_src", unc_path):
+            failures.append("confirm_same_disk refused a share it cannot resolve")
+    finally:
+        raw_scan._ask = saved_ask12
+        raw_scan.physical_disk_number = saved_pdn
+
+    # section 12 / S9: an unusable folder must raise a clear error, not traceback
+    try:
+        raw_scan.run_fast_scan(fast_img, unit, md_only, True, budget=-1,
+                               base_dir=os.path.join(img, "not_a_folder"))
+        failures.append("run_fast_scan accepted an unusable base_dir")
+    except ValueError:
+        pass
+
     # results log must contain every reported hit
     with open(results, "r", encoding="utf-8") as fh:
         log_text = fh.read()
@@ -823,6 +875,8 @@ def main():
     print("review regressions covered: boundary hits across slices, an interrupted slice")
     print("recorded as interrupted, byte-exact .txt windows with a separate transcript,")
     print("Ctrl+C inside the pool and while carving, pattern bytes in provenance and")
+    print("the same-physical-disk refusal with its explicit override, and a clear")
+    print("error (not a traceback) for an unusable output folder.")
     print("one carve budget across slices, a real count in summary.txt, the")
     print("folder's totals on resume, per-mode speed memory and the worker's")
     print("end-of-source clamp, and the smart-text cap plus the readable-copy toggle.")
