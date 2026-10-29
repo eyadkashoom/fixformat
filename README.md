@@ -88,7 +88,7 @@ The hardware is read once; the image can be re-analyzed with different
 signature sets, again and again, at full speed and zero risk to the original
 disk.
 
-## The v5 main menu (in development)
+## Release 5 - the new main menu
 
 `v5/` rebuilds the same tool on top of release 4 and changes the menu. Run
 `v5/run_scan.bat` (or the bundled interpreter: `python/python.exe v5/raw_scan.py`):
@@ -111,6 +111,15 @@ Every scan now prints a `PLAN FOR THIS RUN` block first: mode, how much will be
 read, signature count and an estimated duration taken from the last run
 measured on this machine (`scan_speed.json`), or a clearly-labelled default
 when nothing has been measured yet.
+
+**v5.0.0** - Release 5: a **fast scan** first (first and last 5% inside a
+five-minute budget, saves no files) so you know whether a full pass is worth the
+hours; **progressive 5% slices** with a checkpoint after each; **resume** (menu
+option 6) that continues a `recovered_*` folder from its recorded offset. Every
+run writes `recovered_<disk>_<size>_<time>/` with a `provenance.json` plus a
+browsable `organized_*/` (`by_extension/`, `index.html`). Parallel phase 1
+measured **3.0x** on a real 476.9 GiB image and **4.3x** end-to-end on the
+synthetic fixture, and a JSON profile can replace the extension menu.
 
 ## How a search runs (menu options 1 and 3)
 

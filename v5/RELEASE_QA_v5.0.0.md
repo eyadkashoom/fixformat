@@ -638,3 +638,24 @@ Deliberately not tested here - do not read the PASS above as evidence for any of
 *Tested blob: `v5/raw_scan.py` sha256 `7f5510a1...23be12`. Everything above describes that file and
 nothing else; a later edit needs a re-run of `qa_driver.py a1 a2 a3 s1 s2 s5 s6 s7 s8 s11 c1 c2 c3
 c4 c5 c6 d1 d2 d3 e1 e2` plus the six regression commands.*
+
+
+---
+
+## Post-gate addendum (parent session, commit `5a7acba`)
+
+The gate above says FAIL on one defect. All five findings were acted on; this
+addendum records what was fixed and how it was re-checked, so the document is
+not read as a live FAIL.
+
+| Finding | Resolution | Evidence |
+|---|---|---|
+| **D-1** stopped progressive run written as `complete` | `run_search_flow` no longer rewrites provenance for a progressive run; it only patches `results_log` and the profile keys into what `run_progressive` wrote | probe: 4.2 MB source, pack of answers `3,1,1,all,y,1,y,n,n` -> `status=interrupted`, `resume_offset=1048576`, `hits=2`, `bytes_scanned=1048576` of `4207342` |
+| **O-1** documents disagreed about the same-disk case | `v5/STEP6_ACCEPTANCE.md` section F now requires the REFUSAL (plan Section 12 wins), with the `YES` override | doc diff in `5a7acba` |
+| **O-4** profile deviations | one-character refusal keeps the value as written; a value is searched exactly as typed (no strip, so `"\\n# "` survives); a hex-looking value that is not whole bytes (`41 43 1`) is refused instead of searched as text | probe: `41 43 1` refused, `41 43 1B` accepted, `"\\n# "` accepted, `#` refused |
+| **O-5** literal backslash-r in the imaging progress line | both imaging progress strings now start with a real carriage return | source check + probe |
+| **O-3** selftest took 87-325 s | the 200 KB text fixture became 20 KB with a single hit | `v5/selftest.py` now 3 s; v1-v5 together 6 s |
+
+The gate's own scope note still applies: it did not test real disks, admin
+rights or a 500 GB run. `v5/REAL_MEDIA_v5.md` covers the first of those as far
+as an image file can.

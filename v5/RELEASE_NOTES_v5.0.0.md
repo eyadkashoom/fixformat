@@ -142,12 +142,14 @@ The six menu options, one line each:
 
 ## Release checklist
 
-- [ ] `v1/selftest.py` through `v5/selftest.py` green (CI runs all five)
-- [ ] every item in `v5/REVIEW_v5_steps0-5.md` closed, with `v5/regress_step7.py` green
-- [ ] release QA gate in `v5/STEP6_ACCEPTANCE.md` passed on Windows
-- [ ] REAL_MEDIA numbers recorded (first real image, 476.9 GiB) and this document updated
-- [ ] `python-embed.zip` attached to the release
-- [ ] tag `v5.0.0`
+- [x] `v1/selftest.py` through `v5/selftest.py` green (CI runs all five) - 6 s total
+- [x] every item in `v5/REVIEW_v5_steps0-5.md` closed, with `v5/regress_step7.py` green
+- [x] release QA gate in `v5/RELEASE_QA_v5.0.0.md`: 96 of 97 checks passed; the one
+      defect (D-1) was fixed in `5a7acba` and re-verified by probe (see the
+      addendum in that document)
+- [x] REAL_MEDIA numbers recorded in `v5/REAL_MEDIA_v5.md` (first real image, 476.9 GiB)
+- [x] `python-embed.zip` attached to the release (with `v5.zip`)
+- [x] tag `v5.0.0`
 
 ## Verification status of this document
 
@@ -169,6 +171,8 @@ listed as deferred rather than as new features: the `mmap` image path
   (menu option 6) that continues a `recovered_*` folder from its recorded
   offset. Every run writes `recovered_<disk>_<size>_<time>/` with a
   `provenance.json` plus a browsable `organized_*/` (`by_extension/`,
-  `index.html`). Scanning is **4.3x faster** on the synthetic fixture (92.7 s ->
-  21.6 s, same hits and offsets), and a JSON profile can replace the extension menu.
+  `index.html`). Parallel phase 1 measured **3.0x** on a real 476.9 GiB image
+  (25.15 MB/s on 4 workers vs 8.32 MB/s on one, identical hits) and **4.3x**
+  end-to-end on the synthetic fixture, and a JSON profile can replace the
+  extension menu.
 ```
