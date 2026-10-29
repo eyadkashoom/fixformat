@@ -57,10 +57,13 @@ Three consequences, in order of importance:
    user's files *only on a plaintext volume*. Its priority drops below the FVE
    gate and the validators.
 3. **The 8,675 "noise hits" of 5.0.0 were ciphertext, not markup.** A two-byte
-   needle matches once per 65,536 random bytes; 256 MiB / 65,536 = 4,096 expected
-   matches, and 557 were observed for the removed needle on the alignment slab -
-   the same order. That is the strongest argument yet for the validators in
-   Section 8, and it is now evidence instead of intuition.
+   needle matches once every 65,536 random bytes, i.e. ~16,384 times per GiB. On
+   the first data-dense GiB of this image, 8,675 of 8,899 hits came from the
+   removed `":` needle - 53% of the theoretical random rate - and that region is
+   0.39% zeros with 7.99-8.00 bits/byte, which is now identified as BitLocker
+   ciphertext. The signature was not matching markup; it was matching encryption
+   at close to the rate chance predicts. That is the strongest argument yet for
+   the validators in Section 8, and it is now evidence instead of intuition.
 
 **Also confirmed: the image is holey.** It is a real 512,107,741,184-byte file
 (not sparse), but the data partition is zeros past ~68 GiB. Every "476.94 GiB"
