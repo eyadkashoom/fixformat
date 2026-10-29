@@ -183,6 +183,18 @@ HEX_VALUE_RE = re.compile(r"^[0-9A-Fa-f]{2}(?:\s+[0-9A-Fa-f]{2})*$")
 PROFILE_EXT_RE = re.compile(r"^[a-z0-9_+-]{1,16}$")
 
 
+def is_malformed_hex(value):
+    """True for a string of hex digits and separators that is NOT a valid byte
+    list ('41 43 1', '414'). Catches a typo instead of searching it as text."""
+    text = str(value or "").strip()
+    if not text or looks_like_hex(text):
+        return False
+    if not re.match("^[0-9A-Fa-f" + chr(92) + "s:,]+$", text):
+        return False
+    digits = re.sub("[" + chr(92) + "s:,]", "", text)
+    return len(digits) % 2 == 1 or len(digits) < 2
+
+
 def looks_like_hex(value):
     """True when every space-separated token of `value` is one hex byte."""
     text = str(value or "").strip()
@@ -219,18 +231,27 @@ def parse_signature_profile(data):
         for value in values:
             if not isinstance(value, str) or not value.strip():
                 raise ValueError("profile entry .%s has an empty signature" % ext)
-            text = value.strip()
-            if looks_like_hex(text):
+            # the value is searched EXACTLY as written: "\n# " is a newline, a
+            # hash and a space, and stripping it would search for something else
+            stripped = value.strip()
+            if looks_like_hex(stripped):
                 try:
-                    parse_hex_pattern(text)
+                    parse_hex_pattern(stripped)
                 except ValueError as exc:
                     raise ValueError("profile entry .%s: %s" % (ext, exc))
-            elif len(text) < 2:
+            elif is_malformed_hex(stripped):
+                # '41 43 1' looks like a byte list but is not whole bytes:
+                # searching it as text would silently look for the wrong bytes
+                raise ValueError("profile entry .%s has %r, which looks like a hex "
+                                 "byte list but is not made of whole bytes "
+                                 "(write 41 43 1B, or quote it if you mean text)"
+                                 % (ext, stripped))
+            elif len(value) < 2:
                 # one character matches everything: it would fill the report with
                 # noise instead of finding a file
                 raise ValueError("profile entry .%s has a one-character value %r, "
-                                 "which is too short to search for" % (ext, text))
-            kept.append(text)
+                                 "which is too short to search for" % (ext, value))
+            kept.append(value)
         profile[ext] = kept
     if not profile:
         raise ValueError("the profile is empty")
@@ -1585,8 +1606,11 @@ def scan(target, patterns, chunk_size, results_path, carve_dir=None,
                     interrupted = True
                 zero_bytes += found.get("zero_bytes") or 0
                 # the workers count only the bytes inside their own range, so
-                # this is exact for a full pass, a slice and a partial one
-                scanned = found.get("scanned") or total_size
+                # this is exact for a full pass, a slice and a partial one.
+                # 0 is a real answer - a deadline that fired before the first
+                # range - and "or total_size" used to claim the whole source
+                # (real-media finding: 476.94 GB reported for a 120 s run).
+                scanned = found.get("scanned", 0)
                 use_parallel = True
             except KeyboardInterrupt:
                 # defensive: keep the hits collected so far and never restart
@@ -3420,18 +3444,30 @@ def run_search_flow(target, total, mode="full"):
     print_report(summary, names)
 
     # provenance (Section 1): one JSON next to the extracted data
-    provenance = provenance_payload(target, total, summary, patterns,
-                                    case_sensitive, started_at,
-                                    profile=profile_path or "",
-                                    profile_name=profile_name if profile else "")
-    provenance["run_id"] = run_id
-    provenance["recovered_dir"] = recovered_dir
-    provenance["organized_dir"] = organized_dir
-    provenance["results_log"] = results_path
-    # a finished full scan has no resume point: say where it ended, so the
-    # resume list shows 100% and refuses to redo it (Section 3)
-    provenance["resume_offset"] = int(summary.get("bytes_scanned") or total or 0)
-    write_provenance(recovered_dir, provenance)
+    if progressive:
+        # run_progressive wrote provenance after EVERY slice with the right
+        # status, resume offset and cumulative totals. Rewriting it here is
+        # exactly what turned a run stopped at "continue?" into
+        # status=complete with the folder's totals reset (QA defect D-1).
+        provenance = read_provenance(recovered_dir) or {}
+        provenance["results_log"] = results_path
+        if profile_path:
+            provenance["profile"] = profile_path
+            provenance["profile_name"] = profile_name
+        write_provenance(recovered_dir, provenance)
+    else:
+        provenance = provenance_payload(target, total, summary, patterns,
+                                        case_sensitive, started_at,
+                                        profile=profile_path or "",
+                                        profile_name=profile_name if profile else "")
+        provenance["run_id"] = run_id
+        provenance["recovered_dir"] = recovered_dir
+        provenance["organized_dir"] = organized_dir
+        provenance["results_log"] = results_path
+        # a finished full scan has no resume point: say where it ended, so the
+        # resume list shows 100% and refuses to redo it (Section 3)
+        provenance["resume_offset"] = int(summary.get("bytes_scanned") or total or 0)
+        write_provenance(recovered_dir, provenance)
 
     # organized browsable output (Section 2). If it fails (read-only root, disk
     # full, share gone) the carved files are still in recovered_dir - say so
@@ -3629,12 +3665,12 @@ def create_disk_image(source, dest, chunk_size, show_progress=True, mode="raw"):
             pct = 100.0 * copied / total_size_ref[0]
             remaining = max(0, total_size_ref[0] - copied)
             eta = remaining / rate if rate > 0 else 0
-            line = ("\\rImaging: %s / %s (%.2f%%) | sectors %s / %s | speed %s/s | ETA %s"
+            line = ("\rImaging: %s / %s (%.2f%%) | sectors %s / %s | speed %s/s | ETA %s"
                     % (fmt_bytes(copied), fmt_bytes(total_size_ref[0]), pct,
                        fmt_int(copied // SECTOR_SIZE), fmt_int(total_size_ref[0] // SECTOR_SIZE),
                        fmt_bytes(rate), fmt_hms(eta)))
         else:
-            line = ("\\rImaging: %s copied | sectors %s | speed %s/s"
+            line = ("\rImaging: %s copied | sectors %s | speed %s/s"
                     % (fmt_bytes(copied), fmt_int(copied // SECTOR_SIZE), fmt_bytes(rate)))
         sys.stdout.write(line)
         sys.stdout.flush()

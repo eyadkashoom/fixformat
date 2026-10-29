@@ -517,17 +517,51 @@ print its own "Not reachable" line (validation still refuses the folder one step
 later), and a share that disappears **mid-run** is only caught when the final
 move fails.
 
+## First real media (interrupted 476.94 GiB image, commit `7e2216a`)
+
+`v5/REAL_MEDIA_v5.md` has the full table. Headlines:
+
+| Measurement | Result |
+|---|---|
+| image | `F:\hard512\...img.partial`, 512,107,741,184 B, Windows bootmgr MBR + one GPT protective entry; data 0-14%, all zeros 15-96%, data again 97.0-99.9% |
+| phase 1, 1 GiB slab, 4 workers | 25.15 MB/s (42.7 s), 8,899 hits, 40.6% zeros |
+| phase 1, 1 worker | 8.32 MB/s (129.1 s), byte-identical hits -> **3.02x** |
+| plain read of the same image | 123-164 MB/s cold -> the **matcher**, not the disk, is the limit |
+| all-zero slab | 151 MB/s on 1 worker vs 112 MB/s on 4 -> parallel is a 25-35% penalty on zero-heavy regions |
+| fast scan, 120 s budget | 3.77 GiB sampled (0.79%), 4,248 hits, reached the honest "too little to judge" branch; 10% of this image needs ~26 min |
+| carving, 256 MiB, conservative | 65 windows, 5.1 MB written = 0.019x the source, 19% of wall time |
+| resume | 84 hits -> resumed -> 1,997 hits, `bytes_scanned` = 2 GiB, `complete` |
+| noisiest real hit | `JSON Data (.json)` is the 2-byte needle `":` -> 8,675 of 8,899 hits |
+
+Two defects came out of that run (the first was found independently by the
+release QA as **D-1**) and both are fixed:
+
+* **a stopped progressive run was recorded as `complete`**: `run_search_flow`
+  rewrote provenance after `run_progressive`, using the slice-internal
+  interrupted flag and dropping the cumulative totals. It now only patches
+  `results_log` and the profile keys into what the progressive driver wrote.
+* **`scanned` fell back to the whole source**: `found["scanned"] or total_size`
+  reported 476.94 GB for a 120 s run that read nothing, which is what made the
+  fast scan print a wiped-disk-shaped verdict. It is now `found["scanned"]`,
+  where 0 is a real answer.
+
+Also fixed from the same QA pass: a profile value is now searched exactly as
+written (`"\\n# "` keeps its whitespace instead of being stripped), a
+hex-looking value that is not whole bytes (`41 43 1`) is refused instead of
+searched as text, the imaging progress line uses a real carriage return, and the
+200 KB selftest fixture that made `v5/selftest.py` take 325 s became a 20 KB
+fixture with one hit (3 s, so CI no longer needs a 6 minute timeout).
+
 ## Next step
 
-Everything except the release itself is closed or in flight. Remaining:
+The release is ready to tag: v1-v5 selftests green (6 s total), the independent
+regress suite green, the review closed, `v5/REAL_MEDIA_v5.md` and
+`v5/RELEASE_QA_v5.0.0.md` in the tree, `v5.zip` built next to `python-embed.zip`.
 
-1. `v5/REAL_MEDIA_v5.md` - the first real-media numbers, measured on the user's
-   interrupted 476.9 GiB image (F:\hard512);
-2. `v5/RELEASE_QA_v5.0.0.md` - the release gate, written by an independent agent;
-3. `v5/RELEASE_NOTES_v5.0.0.md` - notes + the README block;
-4. the release: tag `v5.0.0`, attach `python-embed.zip`, tick the checklist.
+Remaining, in order:
 
-Known and accepted limits for 5.0.0: carving cost on text-heavy media (bounded
-now by `SMART_TEXT_MAX_EXTRA` and `ENABLE_READABLE_COPY`), the parallel
-fallback branch is reasoned but not exercised, and no v5 build has read a real
-`\\.\PhysicalDriveN` device (only a real image file).
+1. `git tag -a v5.0.0`, `gh release create v5.0.0 v5.zip python-embed.zip`;
+2. tick the checklist in `v5/RELEASE_NOTES_v5.0.0.md` and paste its README block;
+3. open items for 5.1: the `":` JSON signature is pure noise on real data and
+   should be replaced, auto-parallel should avoid zero-heavy regions, and the
+   parallel fallback branch is still reasoned rather than exercised.

@@ -30,7 +30,8 @@ what makes the section B and F cases testable:
    is what those bytes actually are in a DWG header. A value that is written like a
    byte list but is not whole bytes (`25 50 4G 46`, `41 43 1`) is refused instead of
    being quietly re-read as text.
-3. **A same-disk output root is a warning, never a gate.** Section 8 says "warn";
+3. **A same-disk output root is REFUSED unless you type YES.** Section 12 says
+   "reject";
    Section 12's "refuse by default" is the imaging rule, and that one belongs to step 8.
 
 Deliberately **not** in this checklist (step 8, Section 12 - do not implement here): the
@@ -112,15 +113,24 @@ time: the tool prints `SIGNATURE ERROR: <plain reason>`, then the two-line
 - [ ] Given that mid-run loss happened, the hits found after the loss are written into a `recovered_*` folder next to the script, `provenance.json` records both the original `"output_root"` and the local fallback, the final screen prints both paths, the status is `COMPLETE` and the exit code is 0.
 - [ ] Given a write to the output root fails once and then works again on the retry, the tool keeps using the root and does not print the fallback warning (one transient failure is not a lost share).
 
-## F. Output root - the same-physical-disk warning
+## F. Output root - the same-physical-disk REFUSAL
 
-- [ ] Given the source is a raw disk or volume (`\\.\C:` or `\\.\PhysicalDriveN`) and the output root resolves to the same volume, the tool prints, before `PLAN FOR THIS RUN`, a `WARNING` containing `SAME disk as the source`, the drive letter, the words `can destroy the data`, and `external disk or a share`.
-- [ ] Given that warning is printed, the run is **not** blocked: the next thing on screen is `PLAN FOR THIS RUN`, no override question is asked about the warning, `CANNOT USE THAT FOLDER` never appears, and the run finishes writing to that folder.
-- [ ] Given the source is an image file and the chosen root is on the same volume as the file, one line names the volume (`C:`) and says a copy on another disk is safer, and the run continues without asking anything.
-- [ ] Given the same image file and a root on a different volume (a `subst` letter, or a real second disk), no same-disk line is printed at all.
-- [ ] Given the source is a physical drive whose volume cannot be resolved, the tool makes no same-disk claim - it prints only the standing caution (`Writing onto the disk being scanned can overwrite ...`) and never asserts that the two are the same disk.
-- [ ] Given the default root is kept for an image-file source, no same-disk warning is printed, so an ordinary run stays quiet.
-- [ ] Given the warning is printed, the line begins with `WARNING` and never with `ERROR`, so a caution cannot be mistaken for a refusal.
+**Changed after this checklist was first written.** It required a warning here,
+because V5_PLAN.md Section 8 says "warn". Section 12 of the same plan says
+"reject the destination on the same physical disk", and the release QA
+(`v5/RELEASE_QA_v5.0.0.md`, observation O-1) flagged that the two documents
+disagreed. Section 12 wins: writing recovered data onto the disk it came from
+can destroy the evidence, and a second drive letter on that disk does not help.
+The check compares physical disk numbers, so it also catches the case the old
+drive-letter warning missed.
+
+- [ ] Given the source is a raw disk or volume and the output root resolves to the same PHYSICAL disk (not merely the same letter), the tool prints `REFUSED - THAT FOLDER IS ON THE SAME PHYSICAL DISK AS THE SOURCE`, both disk numbers, and the words `can overwrite the very data`.
+- [ ] Given that refusal, the run does **not** proceed unless the user types `YES` in capitals; anything else (including `y`) keeps the refusal and offers another folder.
+- [ ] Given `YES` is typed, the run continues and writes there.
+- [ ] Given the source is an image file and the root is on the same physical disk, the same refusal applies (an image of the disk is still evidence from that disk).
+- [ ] Given the root is on a different physical disk, or a network share, no refusal and no warning is printed and no question is asked.
+- [ ] Given the refusal cannot decide (the share or the device number cannot be resolved), the tool falls back to the drive-letter comparison and never asserts that two paths are the same disk.
+- [ ] Given `OUTPUT_ROOT` is refused, the run falls back to the script folder and says so in one line instead of aborting.
 
 ## G. Regression - a plain scan must be untouched
 

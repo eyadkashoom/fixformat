@@ -768,15 +768,17 @@ def main():
     # both capped by a setting, because a text-heavy 64 MB fixture produced
     # 767 MB of carved data with the 1 MiB cap and a copy per hit
     text_src = os.path.join(tmpdir, "texty.img")
-    with open(text_src, "wb") as fh:
-        fh.write(b"".join(bytes([65 + (i % 26)]) for i in range(200000)))
+    text_body = bytearray(65 + (i % 26) for i in range(20000))
+    text_body[100:103] = b"QQQ"          # ONE hit: a 3-byte needle that the
+    with open(text_src, "wb") as fh:     # letter cycle cannot produce again
+        fh.write(bytes(text_body))
     text_carve = os.path.join(tmpdir, "texty_carved")
     saved_extra = raw_scan.SMART_TEXT_MAX_EXTRA
     saved_copy = raw_scan.ENABLE_READABLE_COPY
     raw_scan.SMART_TEXT_MAX_EXTRA = 4096
     raw_scan.ENABLE_READABLE_COPY = False
     try:
-        texty = raw_scan.scan(text_src, [("Profile .md note", b"BCD", "md", False)], 4096,
+        texty = raw_scan.scan(text_src, [("Profile .md note", b"QQQ", "md", False)], 4096,
                               os.path.join(tmpdir, "texty.txt"), text_carve,
                               carve_before=1024, carve_after=1024,
                               show_progress=False, min_gap=0)
