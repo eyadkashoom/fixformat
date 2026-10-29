@@ -1321,6 +1321,15 @@ def _scan_range_worker(job):
 
     f = open(target, "rb", buffering=0)
     try:
+        # the read window runs past `end` by max_len to catch a signature that
+        # straddles the boundary - but never past the end of a raw device, which
+        # Windows refuses (review S10)
+        try:
+            device_size = get_device_size(f)
+        except Exception:
+            device_size = 0
+        if device_size:
+            read_limit = min(read_limit, device_size)
         f.seek(aligned)
         carry = b""
         next_off = aligned
@@ -1362,7 +1371,7 @@ def _scan_range_worker(job):
     finally:
         f.close()
     return {"hits": hits, "scanned": scanned, "zero_bytes": zero_bytes,
-            "budget_hit": budget_hit}
+            "budget_hit": budget_hit, "job": (start, end)}
 
 
 def parallel_phase1(target, patterns, start_offset, end_offset, chunk_size, workers,
@@ -1390,10 +1399,12 @@ def parallel_phase1(target, patterns, start_offset, end_offset, chunk_size, work
     zero_bytes = 0
     budget_hit = False
     interrupted = False
+    completed = set()
     ctx = multiprocessing.get_context("spawn")
     try:
         with ctx.Pool(processes=min(workers, len(jobs))) as pool:
             for done, part in enumerate(pool.imap_unordered(_scan_range_worker, jobs), 1):
+                completed.add(tuple(part.get("job") or ()))
                 parts.extend(part.get("hits") or [])
                 scanned += part.get("scanned") or 0
                 zero_bytes += part.get("zero_bytes") or 0
@@ -1408,6 +1419,26 @@ def parallel_phase1(target, patterns, start_offset, end_offset, chunk_size, work
         # the source from byte 0 (that would double-count and waste the read).
         interrupted = True
         print("\nStopped by the user - keeping the ranges that already finished.")
+    except Exception as exc:
+        # A worker died. The ranges that already finished are real results:
+        # rescan ONLY the missing ones here, instead of throwing everything away
+        # and re-reading the source from byte 0 (review S10).
+        print("\nA parallel worker failed (%s) - rescanning the remaining ranges "
+              "in this process." % exc)
+        for job in jobs:
+            span = (job[2], job[3])
+            if span in completed:
+                continue
+            try:
+                part = _scan_range_worker(job)
+            except Exception as inner:
+                print("  range %s-%s failed as well: %s" % (span[0], span[1], inner))
+                continue
+            completed.add(span)
+            parts.extend(part.get("hits") or [])
+            scanned += part.get("scanned") or 0
+            zero_bytes += part.get("zero_bytes") or 0
+            budget_hit = budget_hit or bool(part.get("budget_hit"))
     if show_progress:
         print()
 
@@ -1744,16 +1775,23 @@ def extract_candidate_names(carve_dir, limit=400):
 
 
 def carved_stats(carve_dir):
-    """(file_count, total_bytes, [(filename, size), ...])"""
+    """
+    (file_count, total_bytes, [(filename, size), ...]) for the CARVED DATA only.
+    Sidecars (.triage.txt) and readable transcripts (_readable.txt) are notes
+    about a window, not recovered data - counting them doubled the totals.
+    """
     items = []
     total = 0
     if carve_dir and os.path.isdir(carve_dir):
         for fname in sorted(os.listdir(carve_dir)):
             path = os.path.join(carve_dir, fname)
-            if os.path.isfile(path):
-                size = os.path.getsize(path)
-                total += size
-                items.append((fname, size))
+            if not os.path.isfile(path):
+                continue
+            if fname.endswith(".triage.txt") or fname.endswith(READABLE_SUFFIX):
+                continue
+            size = os.path.getsize(path)
+            total += size
+            items.append((fname, size))
     return len(items), total, items
 
 
@@ -1819,8 +1857,13 @@ def write_index_html(summary, names, report_dir, index_path):
 
 
 
-def write_report(summary, names, report_path):
-    count, total, items = carved_stats(summary["carve_dir"])
+def write_report(summary, names, report_path, carved=None):
+    """`carved` = (count, bytes) measured BEFORE the files were moved, if known."""
+    if carved is not None:
+        count, total = carved
+        items = []
+    else:
+        count, total, items = carved_stats(summary.get("carve_dir") or "")
     lines = []
     lines.append("=== RECOVERY REPORT ===")
     lines.append("date          : %s" % datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
@@ -2173,6 +2216,35 @@ def find_recoveries(roots=None, depth=1):
     return found
 
 
+def add_counts(base, extra):
+    """Sum two {label: count} dicts without losing labels present in one only."""
+    out = dict(base or {})
+    for label, count in (extra or {}).items():
+        out[label] = out.get(label, 0) + int(count or 0)
+    return out
+
+
+def cumulative_totals(prior, summary):
+    """
+    A resumed run continues a folder, so its provenance must hold the folder's
+    TOTAL, not just this pass's numbers (review S7). `prior` is the provenance
+    read before the run (empty for a fresh one).
+    """
+    prior = prior if isinstance(prior, dict) else {}
+    return {
+        "hits": int(prior.get("hits") or 0) + len(summary.get("hits") or []),
+        "counts": add_counts(prior.get("counts") or {}, summary.get("counts") or {}),
+        "carved_files": int(prior.get("carved_files") or 0)
+                        + int(summary.get("carved_files") or 0),
+        "bytes_scanned": int(prior.get("bytes_scanned") or 0)
+                         + int(summary.get("bytes_scanned") or 0),
+        "zero_bytes": int(prior.get("zero_bytes") or 0)
+                      + int(summary.get("zero_bytes") or 0),
+        "elapsed_seconds": round(float(prior.get("elapsed_seconds") or 0.0)
+                                 + float(summary.get("elapsed") or 0.0), 1),
+    }
+
+
 def patterns_from_provenance(prov):
     """
     Rebuild the exact pattern list a run used (review S6).
@@ -2218,7 +2290,8 @@ def patterns_from_provenance(prov):
 
 
 def provenance_payload(target, total, summary, patterns, case_sensitive,
-                       started_at, progress=None, profile="", profile_name=""):
+                       started_at, progress=None, profile="", profile_name="",
+                       totals=None):
     """The provenance.json body for one run (Section 1)."""
     payload = {
         "tool": "fixformat raw_scan.py",
@@ -2254,6 +2327,9 @@ def provenance_payload(target, total, summary, patterns, case_sensitive,
             "elapsed_seconds": round(summary.get("elapsed", 0.0), 1),
             "status": "interrupted" if summary.get("interrupted") else "complete",
         })
+    if totals:
+        # a continued run: the folder's total, not this pass alone
+        payload.update(totals)
     if progress:
         payload.update(progress)
     return payload
@@ -2269,13 +2345,18 @@ def organize_output(summary, run_dir, organized_dir, names=None):
     by_ext = os.path.join(organized_dir, "by_extension")
     os.makedirs(by_ext, exist_ok=True)
 
+    # measure BEFORE moving: after the move carved/ is empty and the report
+    # used to claim "0 files / 0 bytes" (review S5)
+    carved_count, carved_bytes, _carved_items = carved_stats(carve_dir)
+
     moved = 0
     if os.path.isdir(carve_dir):
         for name in sorted(os.listdir(carve_dir)):
             src = os.path.join(carve_dir, name)
             if not os.path.isfile(src):
                 continue
-            is_sidecar = name.endswith(".triage.txt")
+            is_sidecar = (name.endswith(".triage.txt")
+                          or name.endswith(READABLE_SUFFIX))
             if is_sidecar:
                 continue
             ext = os.path.splitext(name)[1].lstrip(".").lower() or "bin"
@@ -2295,7 +2376,7 @@ def organize_output(summary, run_dir, organized_dir, names=None):
         names = extract_candidate_names(by_ext)
     summary_path = os.path.join(organized_dir, "summary.txt")
     try:
-        write_report(summary, names, summary_path)
+        write_report(summary, names, summary_path, carved=(carved_count, carved_bytes))
     except OSError:
         summary_path = ""
     return moved, index_path, summary_path
@@ -2478,6 +2559,9 @@ def run_progressive(target, total, patterns, case_sensitive, recovered_dir,
         return combined
 
     carved_totals = {}          # shared across slices: one budget per run
+    # a resume continues an existing folder: read what it already holds so the
+    # provenance keeps the total instead of resetting to this pass (review S7)
+    prior_prov = read_provenance(recovered_dir) if resume_from else {}
     slice_no = 0
     while True:
         slice_no += 1
@@ -2512,9 +2596,12 @@ def run_progressive(target, total, patterns, case_sensitive, recovered_dir,
             combined["resume_offset"] = end if end is not None else (
                 combined["bytes_scanned"] + start)
         finished = (not slice_interrupted) and (end is None or (total and end >= total))
+        slice_totals = cumulative_totals(prior_prov, combined)
+        combined["totals"] = slice_totals
         prov = provenance_payload(target, total, combined, patterns,
                                   case_sensitive, started_at,
-                                  profile=profile, profile_name=profile_name)
+                                  profile=profile, profile_name=profile_name,
+                                  totals=slice_totals)
         prov.update({"run_id": tag, "recovered_dir": recovered_dir,
                      "organized_dir": organized_dir,
                      "resume_offset": combined["resume_offset"],
@@ -2543,8 +2630,11 @@ def run_progressive(target, total, patterns, case_sensitive, recovered_dir,
 
     # final organized view + summary over everything found so far
     organize_output(combined, recovered_dir, organized_dir)
+    run_totals = cumulative_totals(prior_prov, combined)
+    combined["totals"] = run_totals
     prov = provenance_payload(target, total, combined, patterns, case_sensitive,
-                              started_at, profile=profile, profile_name=profile_name)
+                              started_at, profile=profile, profile_name=profile_name,
+                              totals=run_totals)
     prov.update({"run_id": tag, "recovered_dir": recovered_dir,
                  "organized_dir": organized_dir,
                  "resume_offset": combined["resume_offset"],
@@ -2607,8 +2697,13 @@ def load_speed_rates():
     return rates
 
 
-def remember_speed(kind, rate):
-    """Best-effort: store the throughput of this run (bytes/s) for `kind`."""
+def remember_speed(kind, rate, mode="full"):
+    """
+    Best-effort: store the throughput of this run (bytes/s).
+    Keyed by kind AND mode: a fast scan reads two slices and carves nothing,
+    while a full scan's elapsed includes carving, so mixing them made the
+    pre-scan estimate up to ten times wrong (review S8).
+    """
     try:
         rate = float(rate)
     except (TypeError, ValueError):
@@ -2616,7 +2711,7 @@ def remember_speed(kind, rate):
     if rate <= 0:
         return
     db = load_speed_rates()
-    db[kind] = round(rate, 1)
+    db["%s:%s" % (kind, mode)] = round(rate, 1)
     try:
         with open(_speed_path(), "w", encoding="utf-8") as fh:
             json.dump(db, fh, indent=2)
@@ -2624,23 +2719,26 @@ def remember_speed(kind, rate):
         pass
 
 
-def estimate_scan_seconds(nbytes, target, rates=None):
+def estimate_scan_seconds(nbytes, target, rates=None, mode="full"):
     """
-    (seconds, measured) for reading `nbytes` of `target`. `measured` is False
-    when no run has been timed on this machine yet and DEFAULT_SCAN_RATE is
-    used - the pre-scan summary says which one it is instead of pretending.
+    (seconds, measured) for reading `nbytes` of `target` in `mode` ("full" or
+    "fast"). `measured` is False when this machine has no timed run yet and
+    DEFAULT_SCAN_RATE is used - the pre-scan summary says which one it is
+    instead of pretending.
     """
     if not nbytes:
         return 0.0, False
     rates = load_speed_rates() if rates is None else rates
-    rate = rates.get(source_kind(target))
+    kind = source_kind(target)
+    rate = rates.get("%s:%s" % (kind, mode)) or rates.get(kind)
     if not rate:
         return float(nbytes) / float(DEFAULT_SCAN_RATE), False
     return float(nbytes) / float(rate), True
 
 
 def print_plan_summary(mode, target, total, patterns, case_sensitive,
-                       coverage_bytes=None, budget=None, extra=()):
+                       coverage_bytes=None, budget=None, extra=(),
+                       speed_mode="full"):
     """
     Section 10: one screen with the mode, the source, how much will be read and
     how long it should take - the confirmation that used to be a bare Y/N.
@@ -2665,7 +2763,8 @@ def print_plan_summary(mode, target, total, patterns, case_sensitive,
                                   else "insensitive (ignore case)"))
     print("  read block  : %s" % fmt_bytes(CHUNK_SIZE))
     if coverage_bytes:
-        seconds, measured = estimate_scan_seconds(coverage_bytes, target)
+        seconds, measured = estimate_scan_seconds(coverage_bytes, target,
+                                                  mode=speed_mode)
         print("  est. time   : about %s (%s)"
               % (fmt_hms(seconds), "measured on this machine" if measured
                  else "default %.0f MB/s, nothing measured yet"
@@ -2954,7 +3053,7 @@ def run_fast_flow(target, total):
     print_plan_summary(
         "FAST SCAN - quick triage of the first and last %g%%" % FAST_SCAN_PERCENT,
         target, total, patterns, CASE_SENSITIVE,
-        coverage_bytes=coverage, budget=FAST_SCAN_BUDGET,
+        coverage_bytes=coverage, budget=FAST_SCAN_BUDGET, speed_mode="fast",
         extra=(("signature set", profile_summary(profile, profile_name)
                 if profile is not None else "built-in signatures"),
                ("regions", "%d (%s)" % (len(ranges),
@@ -2987,7 +3086,8 @@ def run_fast_flow(target, total):
     try:
         if summary.get("sampled_bytes") and summary.get("elapsed"):
             remember_speed(source_kind(target),
-                           summary["sampled_bytes"] / max(0.001, summary["elapsed"]))
+                           summary["sampled_bytes"] / max(0.001, summary["elapsed"]),
+                           mode="fast")
     except Exception:
         pass
 
@@ -3206,7 +3306,8 @@ def run_search_flow(target, total, mode="full"):
     try:
         if summary.get("bytes_scanned") and summary.get("elapsed"):
             remember_speed(source_kind(target),
-                           summary["bytes_scanned"] / max(0.001, summary["elapsed"]))
+                           summary["bytes_scanned"] / max(0.001, summary["elapsed"]),
+                           mode="full")
     except Exception:
         pass
 
@@ -3733,9 +3834,11 @@ def resume_flow(resumed):
                                tag=resume_prov.get("run_id", ""),
                                profile=resume_prov.get("profile") or "",
                                profile_name=resume_prov.get("profile_name") or "")
+    totals = combined.get("totals") or {}
     print()
-    print("Recovery updated: %d hits, %d files carved, resume offset %s"
-          % (len(combined["hits"]), combined["carved_files"],
+    print("Recovery updated: %d hits in this folder (%d carved), resume offset %s"
+          % (totals.get("hits", len(combined["hits"])),
+             totals.get("carved_files", combined["carved_files"]),
              fmt_bytes(combined["resume_offset"])))
     print("  recovered : %s" % recovered_dir)
     print("  organized : %s" % organized_dir)

@@ -485,7 +485,9 @@ and mmap (13.6) only pays on repeated scans of the same image.
 
 `v5/REVIEW_v5_steps0-5.md` (kept in the repo) found three blockers and eleven
 should-fix items. Each blocker was reproduced by a probe before any code
-changed, and each now has a regression test in `v5/selftest.py`.
+changed, and every item now has a regression test in `v5/selftest.py` or
+`v5/regress_step7.py` (the latter was written by a second agent, independently,
+before the fixes landed - six tests, all red then, all green now).
 
 | Finding | Reproduced how | State |
 |---|---|---|
@@ -496,7 +498,16 @@ changed, and each now has a regression test in `v5/selftest.py`.
 | S2 a fast scan that read nothing still said "wiped / encrypted / TRIMmed" | `budget=-1` -> 0 B sampled + wiped-disk verdict | **fixed**: below 1% of the source the tool says the budget ran out and refuses to judge |
 | S3 "recoverable data" was hits x the full carve window | - | **renamed** to `carved-window bytes` with the formula and a smart-text caveat; not printed for a partial sample |
 | S9 run folders were created outside the guarded block | read-only root -> traceback | **fixed** for the run folders and the organized step; the message points at `recovered_dir` |
-| S4 Ctrl+C during the parallel pool or carving still raises (findings S4, S5, S6, S7, S8, S10, S11) | not yet fixed | **open - first work of step 7** |
+| S4 Ctrl+C during the parallel pool or while carving escaped as a traceback and lost the report | monkeypatched pool/carver -> `KeyboardInterrupt` out of `scan()` | **fixed**: the pool keeps the ranges that finished, `carve_phase` returns its count so far, and `scan()` has a last-resort handler; probe -> summary with `interrupted=True`, hits preserved |
+| S5 `summary.txt` always said `recovered files : 0` | real run: `summary.txt` 0 / 0 while `index.html` said 2 files | **fixed**: `organize_output` measures with `carved_stats` before the move and passes the numbers to `write_report`; sidecars and `_readable.txt` are no longer counted; a real run now says `recovered files : 2 / 13.02 KB` |
+| S6 a resume rebuilt signatures from label names only | provenance had `signature_labels` and no bytes | **fixed**: `signature_bytes` + `patterns_from_provenance()`; a renamed label keeps its stored bytes, old provenance warns, unreadable bytes refuse the resume |
+| S7 a resume overwrote the folder's totals with the last slice's | `combined` started empty and was written to the same provenance | **fixed**: `cumulative_totals()` + `totals=` on `provenance_payload`; probe: 3 slices -> `hits 3`, resume -> `hits 4` (not 1), `bytes_scanned` = source size, `status complete` |
+| S8 fast and full throughput shared one `scan_speed.json` key | one key `image` | **fixed**: keyed `image:fast` / `image:full` with a fallback to the old key; a real run wrote `{"image:full": 219041.0}` |
+| S10 one worker error discarded every finished range and re-read from byte 0 | `except Exception: del hits[:]` | **fixed**: each worker reports its range, the parent keeps finished ones and rescans only the missing ones in-process; the worker's read window is clamped to the device size. Clamp and job id are tested; the fallback branch is reasoned, not exercised (a worker failure cannot be injected across the process boundary) |
+| S11 `CARVE_LIMIT` reset per slice | 6 slices x limit | **fixed**: `scan(carved_counts=...)` + one dict per run; probe: 12 hits over 6 slices -> 2 files |
+
+Remaining caveat on S9: the fast scan's own `fastscan_*` folder is still created outside
+the guarded block (a read-only script dir raises there).
 
 Open by design, recorded in `v5/STEP6_ACCEPTANCE.md`: the `[U]` picker does not
 print its own "Not reachable" line (validation still refuses the folder one step
@@ -505,19 +516,16 @@ move fails.
 
 ## Next step
 
-Steps 0-6 are done; the review pass closed the three blockers. **Step 7 is next**:
+Steps 0-6 are done and the whole review is closed. **Step 7 is next**:
 
-1. the open should-fix items from the review - S4 (Ctrl+C inside the parallel
-   pool or carving must return a partial summary, not a traceback), S5
-   (`summary.txt` reports 0 files because the move empties `carved/`), S6
-   (provenance stores labels only, not pattern bytes, so a resumed half can be
-   scanned with a different set), S7 (a resume overwrites the folder's
-   cumulative totals), S8 (`scan_speed.json` mixes fast-scan and full-scan
-   throughput), S10 (one worker error discards every completed range), S11
-   (`CARVE_LIMIT` resets per slice, so twenty slices allow 20x the files);
-2. Section 13.6 mmap for image files, then 13.8 - the first measurement on real
-   media (every number so far is a synthetic fixture);
-3. then step 8: the same-physical-disk refusal (today it warns), tag `v5.0.0`,
-   the release with `python-embed.zip`.
+1. Section 13.6 mmap for image files;
+2. Section 13.8 - the first measurement on a fixture that is not a toy: the
+   harness is `v5/bench_step7.py` (written by a second agent), which reports
+   phase-1-only, carving, sequential vs parallel, fast scan and a two-slice
+   progressive run on one 64 MB fixture, and writes JSON for comparison;
+3. only then the numbers in this plan can stop saying "synthetic fixture".
+
+Then step 8: the same-physical-disk refusal (today it warns), tag `v5.0.0`, the
+release with `python-embed.zip`.
 
 Nothing in v5 has ever run against a real disk or a real image file.

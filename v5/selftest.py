@@ -403,8 +403,8 @@ def main():
         measured_rate = 100 * 1024 * 1024
         raw_scan.remember_speed("image", measured_rate)
         rates = raw_scan.load_speed_rates()
-        if abs((rates.get("image") or 0) - measured_rate) > 1:
-            failures.append("remember_speed stored %r" % (rates.get("image"),))
+        if abs((rates.get("image:full") or 0) - measured_rate) > 1:
+            failures.append("remember_speed stored %r" % (rates.get("image:full"),))
         secs, measured = raw_scan.estimate_scan_seconds(
             measured_rate, os.path.join(tmpdir, "x.img"), rates)
         if not measured or abs(secs - 1.0) > 0.01:
@@ -413,6 +413,19 @@ def main():
             measured_rate, os.path.join(tmpdir, "y.img"), {})
         if measured or abs(secs - measured_rate / float(raw_scan.DEFAULT_SCAN_RATE)) > 1:
             failures.append("default estimate = (%r, %r)" % (secs, measured))
+        # review S8: a fast scan and a full scan must not share one number
+        raw_scan.remember_speed("image", measured_rate * 4, mode="fast")
+        rates = raw_scan.load_speed_rates()
+        if rates.get("image:fast") == rates.get("image:full"):
+            failures.append("fast and full throughput share one key")
+        fast_secs, _m = raw_scan.estimate_scan_seconds(
+            measured_rate, os.path.join(tmpdir, "z.img"), rates, mode="fast")
+        if abs(fast_secs - 0.25) > 0.01:
+            failures.append("fast estimate used the wrong rate: %r" % (fast_secs,))
+        full_secs, _m = raw_scan.estimate_scan_seconds(
+            measured_rate, os.path.join(tmpdir, "z.img"), rates, mode="full")
+        if abs(full_secs - 1.0) > 0.01:
+            failures.append("full estimate used the wrong rate: %r" % (full_secs,))
     finally:
         raw_scan.SPEED_FILE = saved_speed_file
 
@@ -692,6 +705,65 @@ def main():
         failures.append("combined carved_files %d != %d files on disk"
                         % (span["carved_files"], span_files))
 
+    # regression (review S5): summary.txt counts what was carved, not what is
+    # left behind after the files were moved into by_extension/
+    s5_src = os.path.join(tmpdir, "s5.img")
+    with open(s5_src, "wb") as fh:
+        fh.write(b"a" * 512 + b".md" + b"b" * 512)
+    s5_carve = os.path.join(tmpdir, "s5_carved")
+    s5_run = os.path.join(tmpdir, "s5_recovered")
+    s5_org = os.path.join(tmpdir, "s5_organized")
+    os.makedirs(s5_run)
+    os.makedirs(s5_org)
+    s5_summary = raw_scan.scan(s5_src, md_only, 128, os.path.join(tmpdir, "s5.txt"),
+                               s5_carve, carve_before=16, carve_after=16,
+                               show_progress=False, min_gap=0)
+    s5_summary["carve_dir"] = s5_carve
+    _moved5, _idx5, s5_report = raw_scan.organize_output(s5_summary, s5_run, s5_org)
+    if not s5_report or not os.path.isfile(s5_report):
+        failures.append("organize_output wrote no summary.txt")
+    else:
+        with open(s5_report, "r", encoding="utf-8") as fh:
+            s5_lines = [line for line in fh.read().splitlines()
+                        if line.startswith("recovered files :")]
+        if not s5_lines:
+            failures.append("summary.txt has no 'recovered files' line")
+        elif s5_lines[0].rstrip().endswith(" 0"):
+            failures.append("summary.txt reports 0 recovered files after the move: %r"
+                            % (s5_lines[0],))
+
+    # regression (review S7): a continued run keeps the folder's totals
+    prior_totals = {"hits": 10, "counts": {"a": 10}, "carved_files": 7,
+                    "bytes_scanned": 1000, "zero_bytes": 500, "elapsed_seconds": 2.5}
+    merged_totals = raw_scan.cumulative_totals(
+        prior_totals, {"hits": [1, 2], "counts": {"a": 1, "b": 2},
+                       "carved_files": 2, "bytes_scanned": 300,
+                       "zero_bytes": 100, "elapsed": 0.5})
+    if (merged_totals["hits"] != 12 or merged_totals["counts"] != {"a": 11, "b": 2}
+            or merged_totals["carved_files"] != 9
+            or merged_totals["bytes_scanned"] != 1300
+            or merged_totals["zero_bytes"] != 600
+            or abs(merged_totals["elapsed_seconds"] - 3.0) > 0.01):
+        failures.append("cumulative_totals = %r" % (merged_totals,))
+    overridden = raw_scan.provenance_payload(
+        "x.img", 10, {"hits": [1], "counts": {"a": 1}}, byte_pats, True,
+        "2026-10-29 09:00:00", totals=merged_totals)
+    if overridden.get("hits") != 12 or overridden.get("carved_files") != 9:
+        failures.append("provenance totals were not applied: %r"
+                        % ({k: overridden.get(k) for k in ("hits", "carved_files")},))
+
+    # regression (review S10): a range that ends at the last byte must not read
+    # past the end of the source, and every worker reports its own range
+    tail_src = os.path.join(tmpdir, "tail.img")
+    with open(tail_src, "wb") as fh:
+        fh.write(b"z" * 200 + b".md")
+    tail_part = raw_scan._scan_range_worker((tail_src, md_only, 0, 202, 64, None))
+    if tuple(tail_part.get("job") or ()) != (0, 202):
+        failures.append("worker did not report its range: %r" % (tail_part.get("job"),))
+    if [h["offset"] for h in tail_part["hits"]] != [200]:
+        failures.append("worker missed the hit in the last bytes: %r"
+                        % ([h["offset"] for h in tail_part["hits"]],))
+
     # results log must contain every reported hit
     with open(results, "r", encoding="utf-8") as fh:
         log_text = fh.read()
@@ -719,7 +791,9 @@ def main():
     print("review regressions covered: boundary hits across slices, an interrupted slice")
     print("recorded as interrupted, byte-exact .txt windows with a separate transcript,")
     print("Ctrl+C inside the pool and while carving, pattern bytes in provenance and")
-    print("one carve budget across slices.")
+    print("one carve budget across slices, a real count in summary.txt, the")
+    print("folder's totals on resume, per-mode speed memory and the worker's")
+    print("end-of-source clamp.")
     shutil.rmtree(tmpdir, ignore_errors=True)
     sys.exit(0)
 
