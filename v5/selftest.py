@@ -764,6 +764,38 @@ def main():
         failures.append("worker missed the hit in the last bytes: %r"
                         % ([h["offset"] for h in tail_part["hits"]],))
 
+    # step 7 benchmark finding: smart text growth and the readable transcript are
+    # both capped by a setting, because a text-heavy 64 MB fixture produced
+    # 767 MB of carved data with the 1 MiB cap and a copy per hit
+    text_src = os.path.join(tmpdir, "texty.img")
+    with open(text_src, "wb") as fh:
+        fh.write(b"".join(bytes([65 + (i % 26)]) for i in range(200000)))
+    text_carve = os.path.join(tmpdir, "texty_carved")
+    saved_extra = raw_scan.SMART_TEXT_MAX_EXTRA
+    saved_copy = raw_scan.ENABLE_READABLE_COPY
+    raw_scan.SMART_TEXT_MAX_EXTRA = 4096
+    raw_scan.ENABLE_READABLE_COPY = False
+    try:
+        texty = raw_scan.scan(text_src, [("Profile .md note", b"BCD", "md", False)], 4096,
+                              os.path.join(tmpdir, "texty.txt"), text_carve,
+                              carve_before=1024, carve_after=1024,
+                              show_progress=False, min_gap=0)
+    finally:
+        raw_scan.SMART_TEXT_MAX_EXTRA = saved_extra
+        raw_scan.ENABLE_READABLE_COPY = saved_copy
+    if not texty["hits"]:
+        failures.append("the text-cap fixture produced no hit")
+    else:
+        window_path = texty["hits"][0]["carved"]
+        window_size = os.path.getsize(window_path)
+        if window_size > 3 + 1024 + 1024 + 4096 + 4096:
+            failures.append("SMART_TEXT_MAX_EXTRA did not cap the window: %d bytes"
+                            % window_size)
+        transcripts = [name for name in os.listdir(text_carve)
+                       if name.endswith(raw_scan.READABLE_SUFFIX)]
+        if transcripts:
+            failures.append("ENABLE_READABLE_COPY=False still wrote %r" % (transcripts,))
+
     # results log must contain every reported hit
     with open(results, "r", encoding="utf-8") as fh:
         log_text = fh.read()
@@ -793,7 +825,7 @@ def main():
     print("Ctrl+C inside the pool and while carving, pattern bytes in provenance and")
     print("one carve budget across slices, a real count in summary.txt, the")
     print("folder's totals on resume, per-mode speed memory and the worker's")
-    print("end-of-source clamp.")
+    print("end-of-source clamp, and the smart-text cap plus the readable-copy toggle.")
     shutil.rmtree(tmpdir, ignore_errors=True)
     sys.exit(0)
 

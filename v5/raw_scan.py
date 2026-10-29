@@ -1038,12 +1038,15 @@ def is_text_like_byte(b):
     return (32 <= b < 127) or b in (9, 10, 13) or b >= 0x80
 
 
-def smart_extend_text(f, start, initial_end, total_size, max_extra=1024*1024):
+def smart_extend_text(f, start, initial_end, total_size, max_extra=None):
     """Extend a carved text window while data looks like readable text.
 
     Returns the new end offset (exclusive). Stops when a run of non-text bytes
-    exceeds a small threshold or max_extra is reached.
+    exceeds a small threshold or max_extra (SMART_TEXT_MAX_EXTRA by default) is
+    reached.
     """
+    if max_extra is None:
+        max_extra = SMART_TEXT_MAX_EXTRA
     end = initial_end
     if total_size:
         hard_limit = min(total_size, initial_end + max_extra)
@@ -1121,8 +1124,9 @@ def carve_window(f, abs_off, plen, total_size, carve_dir, label, ext, before, af
         # window above may itself end in ".txt", and decoding with
         # errors="replace" would destroy every non-UTF-8 byte (Windows-1256
         # Arabic, high-bit binary) - and the raw copy is the only real evidence.
-        if ext in ("md", "py", "json", "yaml", "yml", "env", "txt", "log",
-                   "toml", "cfg", "ini", "csv", "sh", "bat", "ps1", "sql"):
+        if ENABLE_READABLE_COPY and ext in ("md", "py", "json", "yaml", "yml", "env",
+                                            "txt", "log", "toml", "cfg", "ini", "csv",
+                                            "sh", "bat", "ps1", "sql"):
             try:
                 text = data.decode("utf-8", errors="replace")
                 txt_path = os.path.join(
@@ -4021,6 +4025,15 @@ CARVE_DIR = "recovered"
 CARVE_BEFORE = 4096            # bytes kept before the hit
 CARVE_AFTER = 64 * 1024        # bytes kept after the hit
 CARVE_LIMIT = 100              # max carved files per pattern (0 = unlimited)
+# Smart text carving keeps extending a window while the bytes look readable, up
+# to this many extra bytes per hit. On structured text-like media every text hit
+# can grow to the cap, so a 64 MB source produced 767 MB of carved data in the
+# step-7 benchmark: lower this on a small recovery disk.
+SMART_TEXT_MAX_EXTRA = 1024 * 1024
+# Write a readable UTF-8 transcript next to each text window. It doubles the
+# bytes written for text hits and destroys no evidence either way - turn it off
+# when space is short.
+ENABLE_READABLE_COPY = True
 # Suffix of the readable UTF-8 transcript written next to a text window. It is
 # NOT the carved data: the .txt bytes on disk are the recovered truth.
 READABLE_SUFFIX = "_readable.txt"
