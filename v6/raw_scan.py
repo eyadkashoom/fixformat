@@ -69,6 +69,14 @@ try:
 except Exception:
     _display = None
 
+# ---- K5 progress renderer (v6.1.9-dev UI completion) ----------------------
+# scan() routes its per-chunk progress through progress_indicators (themed bar /
+# plain lines / throttled), with a legacy \r fallback if the module is missing.
+try:
+    import progress_indicators as _pi
+except Exception:
+    _pi = None
+
 
 def _theme(role, text):
     # Theme a status line; falls back to plain text if display is unavailable.
@@ -1643,8 +1651,17 @@ def scan(target, patterns, chunk_size, results_path, carve_dir=None,
                 line = ("\rScanned %s | sectors %s | speed %s/s | hits %d"
                         % (fmt_bytes(scanned), fmt_int(scanned // SECTOR_SIZE),
                            fmt_bytes(rate), len(hits)))
-            sys.stdout.write(line)
-            sys.stdout.flush()
+            if _pi is not None:
+                # K5 progress renderer: themed bar on TTY, plain lines otherwise,
+                # throttled; stdout-only so result files never carry ANSI.
+                _pi.ProgressCallback({
+                    "phase": "scan", "scanned_bytes": scanned, "total_bytes": total_size,
+                    "percent": pct if total_size else 0.0, "hits": len(hits), "carved": 0,
+                    "rate_bytes_per_s": rate, "eta_s": eta if total_size else 0,
+                    "status": "complete" if force else "running"})
+            else:
+                sys.stdout.write(line)
+                sys.stdout.flush()
 
         # ---- phase 1: parallel byte ranges when the source is big enough ----
         workers = parallel_worker_count()
