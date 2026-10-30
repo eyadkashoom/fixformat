@@ -60,8 +60,44 @@ import os
 import sys
 import textwrap
 
+# ----------------------------------------------------------------------
+# ANSI color contracts (v6): terminal output only; never leaks to files
+# ----------------------------------------------------------------------
+
+def _ansi_enabled():
+    if os.environ.get("NO_COLOR"):
+        return False
+    try:
+        return sys.stdout.isatty()
+    except Exception:
+        return False
+
+
+_COLOR_GREEN = "\033[32m"
+_COLOR_RED = "\033[31m"
+_COLOR_YELLOW = "\033[33m"
+_COLOR_BLUE = "\033[34m"
+_COLOR_RESET = "\033[0m"
+
+
+def green(text):
+    return ("%s%s%s" % (_COLOR_GREEN, text, _COLOR_RESET)) if _ansi_enabled() else text
+
+
+def red(text):
+    return ("%s%s%s" % (_COLOR_RED, text, _COLOR_RESET)) if _ansi_enabled() else text
+
+
+def yellow(text):
+    return ("%s%s%s" % (_COLOR_YELLOW, text, _COLOR_RESET)) if _ansi_enabled() else text
+
+
+def blue(text):
+    return ("%s%s%s" % (_COLOR_BLUE, text, _COLOR_RESET)) if _ansi_enabled() else text
+
+
 __all__ = ["classify_volume", "read_partitions", "entropy_samples",
-           "probe_source", "explain"]
+           "probe_source", "explain", "green", "red", "yellow", "blue"]
 
 SECTOR = 512                    # GPT and VBR addressing unit
 SAMPLE_BLOCK = 64 * 1024        # entropy sample and content-end block size
@@ -909,23 +945,23 @@ def explain(probe):
                 "%d of %d partition%s %s BitLocker-encrypted; %d can still be "
                 "scanned." % (len(blocked), total, "" if total == 1 else "s",
                               "is" if len(blocked) == 1 else "are", len(scan))):
-            add(line)
+            add(yellow(line))
     elif verdict == "encrypted":
         for line in _wrap_text(
                 "Every partition in this source is BitLocker-encrypted: 0 of %d "
                 "can be scanned." % total):
-            add(line)
+            add(red(line))
     elif verdict == "plaintext":
         for line in _wrap_text(
                 "No BitLocker volume found: all %d partition%s carry a plaintext "
                 "OEM id, so their metadata can be read."
                 % (total, "" if total == 1 else "s")):
-            add(line)
+            add(green(line))
     else:
         for line in _wrap_text(
                 "Nothing here can be scanned: no partition carries a file system "
                 "this tool can read."):
-            add(line)
+            add(yellow(line))
     add("")
 
     for part in blocked:
@@ -1068,7 +1104,7 @@ def main(argv):
         print(__doc__.strip())
         return 2
     probe = probe_source(argv[1])
-    print(probe["message"])
+    print(blue(probe["message"]))
     return 0 if probe["scannable"] else 1
 
 

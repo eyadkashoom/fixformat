@@ -47,6 +47,10 @@ import sys
 import time
 from datetime import datetime
 
+# v6 Task 1: volume gate (pre-scan) + per-run DB (run_db)
+import volume_gate
+import run_db
+
 IS_WINDOWS = os.name == "nt"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 SECTOR_SIZE = 512          # used for the sector counters
@@ -86,6 +90,41 @@ def fmt_int(n):
 def fmt_hms(seconds):
     seconds = int(max(0, seconds))
     return "%02d:%02d:%02d" % (seconds // 3600, (seconds % 3600) // 60, seconds % 60)
+
+
+# ----------------------------------------------------------------------
+# ANSI color contracts (v6): terminal output only; never leaks to files
+# ----------------------------------------------------------------------
+
+def _ansi_enabled():
+    if os.environ.get("NO_COLOR"):
+        return False
+    try:
+        return sys.stdout.isatty()
+    except Exception:
+        return False
+
+_COLOR_GREEN = "\033[32m"
+_COLOR_RED = "\033[31m"
+_COLOR_YELLOW = "\033[33m"
+_COLOR_BLUE = "\033[34m"
+_COLOR_RESET = "\033[0m"
+
+
+def green(text):
+    return ("%s%s%s" % (_COLOR_GREEN, text, _COLOR_RESET)) if _ansi_enabled() else text
+
+
+def red(text):
+    return ("%s%s%s" % (_COLOR_RED, text, _COLOR_RESET)) if _ansi_enabled() else text
+
+
+def yellow(text):
+    return ("%s%s%s" % (_COLOR_YELLOW, text, _COLOR_RESET)) if _ansi_enabled() else text
+
+
+def blue(text):
+    return ("%s%s%s" % (_COLOR_BLUE, text, _COLOR_RESET)) if _ansi_enabled() else text
 
 
 def parse_hex_pattern(text):
@@ -3292,6 +3331,28 @@ def run_search_flow(target, total, mode="full"):
     else:
         print("Size            : unknown (will scan until end of media)")
 
+    # v6 gate: read-only pre-scan probe (Task 1) - verdict exposed
+    print()
+    try:
+        probe = volume_gate.probe_source(target)
+        # Expose verdict clearly so callers and logs see it immediately
+        verdict = probe.get("verdict") or "unknown"
+        scannable = probe.get("scannable") or []
+        blocked = probe.get("blocked") or []
+        print("[GATE] verdict=%s | scannable=%d | blocked=%d | source=%s"
+              % (verdict, len(scannable), len(blocked), target))
+        print(volume_gate.explain(probe))
+        if verdict == "encrypted" and blocked:
+            print()
+            print("WARNING: the target appears fully BitLocker-encrypted.")
+            print("A full scan would return false positives only; nothing useful")
+            print("will be recovered without a 48-digit recovery password or .bek key.")
+        if not scannable and not blocked:
+            print()
+            print("WARNING: no scannable volumes found; nothing to recover.")
+    except Exception as exc:
+        print("Volume gate probe failed (%s); continuing without gate." % exc)
+
     # ---------------- STEP 2 (Section 7: built-in set or a JSON profile) ----
     try:
         pattern_source, profile, profile_name = ask_signature_source()
@@ -3395,7 +3456,30 @@ def run_search_flow(target, total, mode="full"):
         sys.exit(1)
     results_path = os.path.join(recovered_dir, RESULTS_FILE)
     carve_dir = os.path.join(recovered_dir, "carved") if ENABLE_CARVING else None
+    # v6 DB: open/create per-run SQLite next to the results
+    # The run database is an aid, never a precondition: if it cannot be created
+    # (locked file, full disk, an older schema) the scan still runs and says so.
+    #
+    # 'mode' is the recovery mode of V6_PLAN D12, not the slicing strategy: full
+    # vs progressive says how the scan walks the source, while the recovery mode
+    # says whether bytes are written now or after a report. run_db accepts the
+    # two recovery modes only, so passing 'full'/'progressive' raised ValueError
+    # on EVERY run.
+    db_path = os.path.join(recovered_dir, "run.db")
+    db_conn = None
+    run_db_id = None
+    try:
+        db_conn = run_db.open_run_db(db_path)
+        run_db_id = run_db.new_run(db_conn, tool_version=VERSION,
+                                   started=started_at, source=target,
+                                   source_size=total or 0,
+                                   mode="extract-while-scanning")
+    except Exception as exc:
+        print("run db         : unavailable (%s)" % exc)
+        print("                 the scan continues without the database")
     print("results folder  : %s" % recovered_dir)
+    if run_db_id is not None:
+        print("run db         : %s (run id %d)" % (db_path, run_db_id))
 
     try:
         if progressive:

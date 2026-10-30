@@ -11,12 +11,20 @@ Checks:
   5. case-sensitive vs case-insensitive matching works,
   6. carved windows contain the pattern bytes,
   7. candidate file names are extracted from carved data.
+8. the volume-gate pre-scan hook exposes its verdict, warns without
+   blocking, and still probes the raw target when the size is unknown.
+9. the ANSI/color helpers integrate cleanly: enabled/disabled modes in
+   both modules, NO_COLOR + non-TTY invariants, explain() verdict colors,
+   and no ESC leaks into any file written during the run.
 """
 
+import contextlib
 import hashlib
 import inspect
+import io
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -24,7 +32,9 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+import gate_selftest  # noqa: E402
 import raw_scan  # noqa: E402
+import volume_gate  # noqa: E402
 
 CHUNK = 256
 MIN_GAP = 150
@@ -798,6 +808,133 @@ def main():
         if transcripts:
             failures.append("ENABLE_READABLE_COPY=False still wrote %r" % (transcripts,))
 
+    # v6 Task 1: the volume-gate pre-scan hook (K1) - the verdict is exposed,
+    # encrypted/mixed disks warn without blocking, and an unknown size (the
+    # shape of open_target on a volume device such as \\.\C:, which refuses
+    # a seek-to-end) still probes the raw target. Synthetic fixtures only;
+    # raw_scan.py is read-only here, so the hook is driven through
+    # run_search_flow with STEP 2 stubbed to stop right after the gate.
+    gate_plain = os.path.join(tmpdir, "gate_plain.img")
+    gate_selftest.make_gpt_image(gate_plain, [
+        dict(type=gate_selftest.BASIC_DATA, name="Basic data partition",
+             sectors=256, vbr=gate_selftest.ntfs_vbr(),
+             fill=gate_selftest.text_fill),
+    ])
+    gate_mixed = os.path.join(tmpdir, "gate_mixed.img")
+    gate_selftest.make_gpt_image(gate_mixed, [
+        dict(type=gate_selftest.BASIC_DATA, name="Basic data partition",
+             sectors=256, vbr=gate_selftest.ntfs_vbr(),
+             fill=gate_selftest.text_fill),
+        dict(type=gate_selftest.BASIC_DATA, name="Basic data partition",
+             sectors=256, vbr=gate_selftest.fve_vbr(),
+             fill=gate_selftest.random_fill),
+    ])
+    gate_fve = os.path.join(tmpdir, "gate_fve.img")
+    gate_selftest.make_gpt_image(gate_fve, [
+        dict(type=gate_selftest.BASIC_DATA, name="Basic data partition",
+             sectors=256, vbr=gate_selftest.fve_vbr(),
+             fill=gate_selftest.random_fill),
+    ])
+
+    # the hook must probe the raw target, print the verdict before STEP 2,
+    # and never exit: a warning that aborts the run would be a silent block.
+    hook_src = inspect.getsource(raw_scan.run_search_flow)
+    probe_at = hook_src.find("probe_source(target)")
+    gate_at = hook_src.find("[GATE]")
+    step2_at = hook_src.find("= ask_signature_source()")
+    if probe_at < 0 or gate_at < 0 or step2_at < 0 \
+            or not (probe_at < gate_at < step2_at):
+        failures.append("run_search_flow has no gate probe of the raw target "
+                        "before STEP 2 (size=None regression)")
+        probe_at, step2_at = 0, 0
+    hook_block = hook_src[probe_at:step2_at]
+    if "sys.exit" in hook_block \
+            or re.search(r"(?m)^\s*return\b", hook_block):
+        failures.append("the gate hook exits or returns early: it must warn, never block")
+
+    # drive the real pre-scan path: total=0 is the unknown-size shape, and the
+    # STEP 2 stub proves the gate let the run through by stopping it there.
+    gate_wants = (
+        ("plaintext", gate_plain,
+         "[GATE] verdict=plaintext | scannable=1 | blocked=0"),
+        ("mixed", gate_mixed,
+         "[GATE] verdict=mixed | scannable=1 | blocked=1"),
+        ("encrypted", gate_fve,
+         "[GATE] verdict=encrypted | scannable=0 | blocked=1"),
+    )
+    real_probe = volume_gate.probe_source
+    gate_seen = []
+    gate_times = {}
+
+    def spy_probe(target, *args, **kwargs):
+        started = time.time()
+        try:
+            return real_probe(target, *args, **kwargs)
+        finally:
+            gate_times[target] = time.time() - started
+            gate_seen.append(target)
+
+    def stop_after_gate():
+        raise SystemExit(77)
+
+    saved_probe = volume_gate.probe_source
+    saved_ask_sig = raw_scan.ask_signature_source
+    volume_gate.probe_source = spy_probe
+    raw_scan.ask_signature_source = stop_after_gate
+    try:
+        for label, image, want_line in gate_wants:
+            del gate_seen[:]
+            buf = io.StringIO()
+            hook_start = time.time()
+            try:
+                with contextlib.redirect_stdout(buf):
+                    raw_scan.run_search_flow(image, 0)
+            except SystemExit as exc:
+                hook_elapsed = time.time() - hook_start
+                if exc.code != 77:
+                    failures.append("run_search_flow(%s) exited with %r: "
+                                    "gate warnings must not block" % (label, exc.code))
+                    continue
+            except Exception as exc:
+                failures.append("run_search_flow(%s) raised %r inside the gate"
+                                % (label, exc))
+                continue
+            else:
+                failures.append("run_search_flow(%s) never reached STEP 2: "
+                                "the gate blocked the scan" % label)
+                continue
+            text_out = buf.getvalue()
+            if gate_seen != [image]:
+                failures.append("the gate probed %r instead of the raw target "
+                                "for the %s fixture" % (gate_seen, label))
+            if "Size            : unknown" not in text_out:
+                failures.append("the %s run did not take the unknown-size path"
+                                % label)
+            if want_line not in text_out:
+                failures.append("hook verdict line missing for %s (want %r)"
+                                % (label, want_line))
+            if label == "plaintext" and "No BitLocker volume found" not in text_out:
+                failures.append("the plaintext hook did not confirm a clean disk")
+            if label == "mixed" and "is BitLocker-encrypted" not in text_out:
+                failures.append("the mixed hook did not name the encrypted partition")
+            if label == "encrypted" and "fully BitLocker-encrypted" not in text_out:
+                failures.append("the encrypted hook printed no BitLocker warning")
+            probe_secs = gate_times.get(image)
+            if probe_secs is None or probe_secs > 5.0:
+                failures.append("probe_source took %s on the %s fixture "
+                                "(budget 5 s)"
+                                % ("missing" if probe_secs is None
+                                   else "%.2f s" % probe_secs, label))
+            if hook_elapsed is None or hook_elapsed > 5.0:
+                failures.append("the pre-scan hook took %s on the %s fixture "
+                                "(budget 5 s)"
+                                % ("missing" if hook_elapsed is None
+                                   else "%.2f s" % hook_elapsed, label))
+    finally:
+        volume_gate.probe_source = saved_probe
+        raw_scan.ask_signature_source = saved_ask_sig
+
+
     # section 12: a destination on the source's own PHYSICAL disk is refused
     bs12 = chr(92)
     dev_form = bs12 + bs12 + "." + bs12 + "PhysicalDrive0"
@@ -850,6 +987,240 @@ def main():
     except ValueError:
         pass
 
+    # v6 K4: ANSI/color helper integration (raw_scan + volume_gate) - enabled
+    # and disabled modes, contract invariants, and regression cases.
+    # Synthetic fixtures only; monkeypatches are restored in finally blocks.
+    ansi_skips = []
+    _ANSI_ESC = "\x1b["
+    _ANSI_RESET = "\x1b[0m"
+    _ANSI_CODES = {"green": "\x1b[32m", "red": "\x1b[31m",
+                   "yellow": "\x1b[33m", "blue": "\x1b[34m"}
+    try:
+        _ansi_live = raw_scan._ansi_enabled()
+    except Exception as _ansi_exc:
+        ansi_skips.append("live _ansi_enabled() raised %r; enabled-path via stub only"
+                          % (_ansi_exc,))
+    else:
+        if _ansi_live:
+            ansi_skips.append("live stdout is a TTY: enabled-path exercised live")
+        else:
+            ansi_skips.append("live stdout is non-TTY: disabled-path exercised live; "
+                              "enabled-path via stub")
+
+    for _mod_label, _mod in (("raw_scan", raw_scan),
+                             ("volume_gate", volume_gate)):
+        if not callable(getattr(_mod, "_ansi_enabled", None)):
+            failures.append("%s._ansi_enabled missing or not callable" % _mod_label)
+            continue
+        for _fname in ("green", "red", "yellow", "blue"):
+            if not callable(getattr(_mod, _fname, None)):
+                failures.append("%s.%s helper missing or not callable"
+                                % (_mod_label, _fname))
+        if failures and any(_mod_label in item and "helper missing" in item
+                            for item in failures[-4:]):
+            continue
+        _orig_flag = _mod._ansi_enabled
+        try:
+            _mod._ansi_enabled = lambda: False
+            for _fname in ("green", "red", "yellow", "blue"):
+                _fn = getattr(_mod, _fname)
+                if _fn("plain") != "plain":
+                    failures.append("%s.%s(disabled) altered text: %r"
+                                    % (_mod_label, _fname, _fn("plain")))
+                if _ANSI_ESC in _fn("plain"):
+                    failures.append("%s.%s(disabled) leaked ESC" % (_mod_label, _fname))
+                if _fn("") != "":
+                    failures.append("%s.%s(disabled) altered empty string"
+                                    % (_mod_label, _fname))
+                if _fn(ARABIC) != ARABIC:
+                    failures.append("%s.%s(disabled) altered unicode"
+                                    % (_mod_label, _fname))
+            _mod._ansi_enabled = lambda: True
+            for _fname, _code in _ANSI_CODES.items():
+                _fn = getattr(_mod, _fname)
+                _out = _fn("plain")
+                if _code not in _out or _ANSI_RESET not in _out:
+                    failures.append("%s.%s(enabled) missing wrap: %r"
+                                    % (_mod_label, _fname, _out))
+                if "plain" not in _out:
+                    failures.append("%s.%s(enabled) dropped input text"
+                                    % (_mod_label, _fname))
+                if _out != _code + "plain" + _ANSI_RESET:
+                    failures.append("%s.%s(enabled) format = %r, want exact wrap"
+                                    % (_mod_label, _fname, _out))
+        finally:
+            _mod._ansi_enabled = _orig_flag
+
+    # contract invariants on the REAL _ansi_enabled: NO_COLOR wins over a TTY,
+    # a non-TTY disables, and a TTY without NO_COLOR enables.
+    class _AnsiFakeTTY(io.StringIO):
+        def isatty(self):
+            return True
+
+    class _AnsiFakeNoTTY(io.StringIO):
+        def isatty(self):
+            return False
+
+    class _AnsiBoomTTY(io.StringIO):
+        def isatty(self):
+            raise OSError("no tty here")
+
+    _saved_stdout = sys.stdout
+    _saved_nocolor = os.environ.get("NO_COLOR")
+    try:
+        for _mod_label, _mod in (("raw_scan", raw_scan),
+                                 ("volume_gate", volume_gate)):
+            os.environ["NO_COLOR"] = "1"
+            sys.stdout = _AnsiFakeTTY()
+            try:
+                if _mod._ansi_enabled():
+                    failures.append("%s._ansi_enabled ignored NO_COLOR on a TTY"
+                                    % _mod_label)
+            finally:
+                sys.stdout = _saved_stdout
+            if "NO_COLOR" in os.environ:
+                del os.environ["NO_COLOR"]
+            sys.stdout = _AnsiFakeNoTTY()
+            try:
+                if _mod._ansi_enabled():
+                    failures.append("%s._ansi_enabled enabled on non-TTY"
+                                    % _mod_label)
+            finally:
+                sys.stdout = _saved_stdout
+            sys.stdout = _AnsiFakeTTY()
+            try:
+                if not _mod._ansi_enabled():
+                    failures.append("%s._ansi_enabled disabled on TTY without NO_COLOR"
+                                    % _mod_label)
+            finally:
+                sys.stdout = _saved_stdout
+            sys.stdout = _AnsiBoomTTY()
+            try:
+                if _mod._ansi_enabled():
+                    failures.append("%s._ansi_enabled did not fail closed on isatty error"
+                                    % _mod_label)
+            finally:
+                sys.stdout = _saved_stdout
+            os.environ["NO_COLOR"] = ""
+            sys.stdout = _AnsiFakeTTY()
+            try:
+                if not _mod._ansi_enabled():
+                    failures.append("%s._ansi_enabled treated empty NO_COLOR as set"
+                                    % _mod_label)
+            finally:
+                sys.stdout = _saved_stdout
+    finally:
+        sys.stdout = _saved_stdout
+        if _saved_nocolor is None:
+            os.environ.pop("NO_COLOR", None)
+        else:
+            os.environ["NO_COLOR"] = _saved_nocolor
+
+    # explain() verdict -> color mapping, plus strip-invariant regression.
+    _scan_part = {"index": 0, "bytes": 131072, "kind": "ntfs",
+                  "name": "Basic data partition"}
+    _enc_part = {"index": 1, "bytes": 131072, "kind": "bitlocker",
+                 "name": "Basic data partition", "entropy": []}
+    _plain_probe = {"verdict": "plaintext", "partitions": [_scan_part],
+                    "blocked": [], "scannable": [_scan_part], "skipped": [],
+                    "content": {}, "size": None}
+    _enc_probe = {"verdict": "encrypted", "partitions": [_enc_part],
+                  "blocked": [_enc_part], "scannable": [], "skipped": [],
+                  "content": {}, "size": None}
+    _mixed_probe = {"verdict": "mixed", "partitions": [_scan_part, _enc_part],
+                    "blocked": [_enc_part], "scannable": [_scan_part],
+                    "skipped": [], "content": {}, "size": None}
+    _empty_probe = {"verdict": "empty", "partitions": [], "blocked": [],
+                    "scannable": [], "skipped": [], "content": {}, "size": None}
+    _err_probe = {"error": "denied", "error_hint": "hint",
+                  "partitions": [], "blocked": [], "scannable": [],
+                  "skipped": [], "content": {}, "size": None}
+    _orig_vg_flag = volume_gate._ansi_enabled
+    try:
+        volume_gate._ansi_enabled = lambda: True
+        _e_plain = volume_gate.explain(_plain_probe)
+        _e_enc = volume_gate.explain(_enc_probe)
+        _e_mixed = volume_gate.explain(_mixed_probe)
+        _e_empty = volume_gate.explain(_empty_probe)
+        _e_err = volume_gate.explain(_err_probe)
+        if "\x1b[32m" not in _e_plain:
+            failures.append("explain(plaintext, enabled) missing green (32m)")
+        if "\x1b[31m" not in _e_enc:
+            failures.append("explain(encrypted, enabled) missing red (31m)")
+        if "\x1b[33m" not in _e_mixed:
+            failures.append("explain(mixed, enabled) missing yellow (33m)")
+        if "\x1b[33m" not in _e_empty:
+            failures.append("explain(empty, enabled) missing yellow (33m)")
+        if "\x1b[" in _e_err:
+            failures.append("explain(error, enabled) should stay uncolored, got %r"
+                            % (_e_err[:80],))
+        volume_gate._ansi_enabled = lambda: False
+        _p_plain = volume_gate.explain(_plain_probe)
+        _p_enc = volume_gate.explain(_enc_probe)
+        _p_mixed = volume_gate.explain(_mixed_probe)
+        _p_empty = volume_gate.explain(_empty_probe)
+        for _lbl, _txt in (("plaintext", _p_plain), ("encrypted", _p_enc),
+                           ("mixed", _p_mixed), ("empty", _p_empty)):
+            if "\x1b[" in _txt:
+                failures.append("explain(%s, disabled) leaked ESC" % _lbl)
+        for _lbl, _en, _dis in (("plaintext", _e_plain, _p_plain),
+                                ("encrypted", _e_enc, _p_enc),
+                                ("mixed", _e_mixed, _p_mixed),
+                                ("empty", _e_empty, _p_empty)):
+            _stripped = re.sub(r"\x1b\[[0-9;]*m", "", _en)
+            if _stripped != _dis:
+                failures.append("explain(%s) changes text besides codes" % _lbl)
+    finally:
+        volume_gate._ansi_enabled = _orig_vg_flag
+
+    # volume_gate.main must wrap the terminal message in blue(); the gate
+    # decision logic itself is covered by gate_selftest (untouched here).
+    try:
+        _main_src = inspect.getsource(volume_gate.main)
+    except (IOError, TypeError) as _exc:
+        ansi_skips.append("volume_gate.main source unavailable (%s); blue-wire check "
+                          "skipped" % (_exc,))
+    else:
+        if "blue(" not in _main_src:
+            failures.append("volume_gate.main does not wrap output in blue()")
+    if "green" not in getattr(volume_gate, "__all__", []) \
+            or "red" not in getattr(volume_gate, "__all__", []) \
+            or "yellow" not in getattr(volume_gate, "__all__", []) \
+            or "blue" not in getattr(volume_gate, "__all__", []):
+        failures.append("volume_gate.__all__ missing color helpers: %r"
+                        % (getattr(volume_gate, "__all__", None),))
+
+    # no-file-leak regression: force colors ON, rescan the synthetic image,
+    # and prove the results file carries no ESC and identical hits.
+    _orig_rs_flag = raw_scan._ansi_enabled
+    _orig_vg_flag2 = volume_gate._ansi_enabled
+    raw_scan._ansi_enabled = lambda: True
+    volume_gate._ansi_enabled = lambda: True
+    try:
+        _leak_results = os.path.join(tmpdir, "ansi_leak.txt")
+        _leak_summary = raw_scan.scan(img, patterns, CHUNK, _leak_results, None,
+                                      carve_before=64, carve_after=64,
+                                      show_progress=False, min_gap=MIN_GAP)
+    finally:
+        raw_scan._ansi_enabled = _orig_rs_flag
+        volume_gate._ansi_enabled = _orig_vg_flag2
+    with open(_leak_results, "r", encoding="utf-8") as _fh:
+        _leak_text = _fh.read()
+    if "\x1b[" in _leak_text:
+        failures.append("scan results file leaked ANSI with colors forced on")
+    _leak_hits = sorted((r["label"], r["offset"]) for r in _leak_summary["hits"])
+    if _leak_hits != sorted(expected):
+        failures.append("scan hits changed with colors forced on: %r" % (_leak_hits,))
+    for _fname in (report_path, os.path.join(tmpdir, "profile_results.txt"),
+                   os.path.join(tmpdir, "deadline.txt")):
+        if os.path.isfile(_fname):
+            with open(_fname, "r", encoding="utf-8", errors="replace") as _fh:
+                if "\x1b[" in _fh.read():
+                    failures.append("file %s leaked ANSI" % os.path.basename(_fname))
+    with open(fast["report_path"], "r", encoding="utf-8") as _fh:
+        if "\x1b[" in _fh.read():
+            failures.append("fast scan report leaked ANSI")
+
     # results log must contain every reported hit
     with open(results, "r", encoding="utf-8") as fh:
         log_text = fh.read()
@@ -882,6 +1253,14 @@ def main():
     print("one carve budget across slices, a real count in summary.txt, the")
     print("folder's totals on resume, per-mode speed memory and the worker's")
     print("end-of-source clamp, and the smart-text cap plus the readable-copy toggle.")
+    print("v6 Task 1 gate verified: plaintext allows, encrypted/mixed warn without")
+    print("blocking, the hook probes the raw target at unknown size, the verdict is")
+    print("exposed from the pre-scan path, and every probe stays under budget.")
+    print("v6 K4 ANSI verified: helpers in raw_scan + volume_gate (enabled/disabled),")
+    print("NO_COLOR/non-TTY/isatty-error invariants, explain() verdict colors with")
+    print("strip-invariant text, blue() terminal wire-up, and no ESC in any file.")
+    for _skip in ansi_skips:
+        print("ANSI note: %s" % _skip)
     shutil.rmtree(tmpdir, ignore_errors=True)
     sys.exit(0)
 

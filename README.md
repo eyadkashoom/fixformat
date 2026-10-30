@@ -42,6 +42,8 @@ The toolkit **never writes to a disk it reads**.
 | `v1/` | Release 1 - the scanner: interactive disk selection, multi-encoding search, carving, reporting, save prompt. |
 | `v2/` | Release 2 - adds interactive file-extension selection, case-sensitivity choice, `y/n` confirmations, step-by-step English guidance. |
 | `v3/` | Release 3 - adds the main menu: (1) search a disk, (2) create a full disk image, (3) analyze a disk image. |
+| `v5/` | Release 5 - fast scan (first 5% + last 5%), progressive 5% slices, resume, provenance, organized output, JSON signature profile. |
+| `v6/` | Release 6 - pre-scan volume gate (BitLocker/FVE detection) + per-run SQLite run database. See `v6/docs_plan.md` and `v6/RUN_DB_GUIDE.md`. |
 | `README.md` | This document. |
 | `python/` | (not in git) the bundled embedded Python 3.12 runtime - see below. |
 
@@ -125,6 +127,187 @@ browsable `organized_*/` (`by_extension/`, `index.html`). Parallel phase 1
 measured **3.0x** on a real 476.9 GiB image and **4.3x** end-to-end on the
 synthetic fixture, and a JSON profile can replace the extension menu.
 
+## Release 6 - the v6 bundle (read-only, add-on)
+
+`v6/` is a single, coherent bundle of new features that change what a scan can
+honestly report. One new source module backs each feature; every module is
+stdlib-only, disjoint from the others, and exercised by self-tests:
+
+| Area | New files | What it does |
+|------|-----------|--------------|
+| **DB / extraction** | `v6/run_db.py`, `v6/raw_scan.py` (Task 1 wiring) | Per-run SQLite `run.db` plus a pre-scan volume gate (`v6/volume_gate.py`) that classifies each partition as plaintext / mixed / encrypted / empty before any signature search. |
+| **Plan screen / reports / audit** | `v6/plan_screen.py`, `v6/reports_integration.py`, `v6/audit_serialization.py` (delivered, standalone) | A recovery-plan screen rendered from the run DB, three report formats (`report.md` / `.csv` / `.html` plus `audit.txt`), all from public run_db APIs only. |
+| **Validators / assembly** | `v6/validators.py`, `v6/assembly.py`, `v6/test_v6_steps67.py` | JPEG / PNG / PDF / ZIP / SQLite validation with actionable errors for malformed inputs; sequential + 2-fragment "best-guess continuation" (BGC) assembly returning fragments, gap bytes and confidence. |
+| **Adaptive operations** | `v6/performance/operations.py`, `v6/performance/selftest_perf.py` | Adaptive operation selection (adaptive_parallel vs single_worker_skip), Shannon entropy, parallel penalty accounting, fast-scan calibration, and an opt-in Direct I/O path with a safe buffered fallback. |
+
+### Volume gate (pre-scan)
+
+Before any signature search, `volume_gate.probe_source()` reads the partition
+table once and classifies every partition by its VBR OEM id at offset 3:
+`NTFS    ` (plaintext NTFS), `-FVE-FS-` (BitLocker ciphertext), `MSDOS5.0`/`
+exFAT (FAT, usually the EFI system partition), eight zero bytes (unformatted/MSR),
+or anything else (unknown). `volume_gate.explain()` prints the verdict. Four
+outcomes apply: **encrypted** (abort - nothing recoverable without the 48-digit
+recovery password or a `.bek` file), **mixed** (skip only the encrypted
+partitions), **plaintext** (full scan proceeds), and **empty** (report, no
+scan). The gate is read-only, never guesses a key, never attempts decryption,
+and never lets an encrypted volume produce candidates that look recoverable -
+the 8,675 "hits" of v5.0.0 on the user's real image were BitLocker ciphertext,
+not markup.
+
+### Run database (per-run SQLite)
+
+Each run now writes a per-run SQLite file (`run_db.py`, `run.db` next to
+`provenance.json`), replacing the append-only text log. It records the run,
+source and size, signature set, region map (zero/entropy), candidates,
+fragments and signature counts. A `ranked` view answers "only validated files
+over 100 KB?", "have I already recovered this file?" and "what changed since
+the last run?" with one query; `summary()` and `dedupe_by_sha256()` cover the
+report statistics. See `v6/RUN_DB_GUIDE.md` and the API reference in
+`v6/API.md`.
+
+### Plan screen, reports, audit
+
+The plan screen renders a recovery plan from the run database
+(`run_db.plan_extraction()` / `summary()`); the reports writer emits
+`report.md` / `report.csv` / `report.html` (`run_db.write_report()`); and
+`audit_serialization.py` writes `audit.txt` - a stable-field serialization of
+ranked candidates (offset, length, ext, fragments, confidence, label, validated,
+sha256). All three use the run_db public APIs only and stay disjoint from the
+scan, validator and performance modules. See `v6/CLI_UX_SPEC.md` for the
+display-contract mapping and `v6/RUN_DB_GUIDE.md` for the schema.
+
+### Validators (JPEG / PNG / PDF / ZIP / SQLite)
+
+Every recovered candidate is validated before it is carved or reported:
+`validate(data, fmt) -> (validated, confidence, validator, fragments, gap_bytes,
+error)`. A candidate is "recovered" only when a validator accepts its header
+structure. Malformed inputs (truncated JPEG, missing PNG IHDR/IEND, PDF without
+xref, ZIP without EOCD, SQLite without the magic header) get actionable error
+messages. See `v6/VALIDATORS_GUIDE.md`.
+
+### Fragmented assembly
+
+`assemble(fragments) -> (assembled, fragments_n, gap_bytes, confidence, error)`
+combines validated fragments: single fragment returns it as-is (confidence
+0.95); two fragments fall back to "best-guess continuation" (BGC) over gaps
+0..min(limit,256); three or more concatenate in order (confidence 0.82).
+Returns `gap_bytes` and `confidence` so reports can say how much data was
+filled and how certain the assembly is. See `v6/VALIDATORS_GUIDE.md`.
+
+### Adaptive operations — detail (entropy / parallel penalty / calibration / Direct I/O)
+
+The scanner adapts its operation to the data it samples, replacing a fixed
+mode with content-driven selection. All functions live in
+`v6/performance/operations.py` and are stdlib-only, deterministic, and
+reproducible.
+
+#### Adaptive operation selection — `select_op(sample_bytes) -> str`
+
+`select_op()` picks the scan op per sample byte content:
+
+| op | condition | meaning |
+|----|-----------|---------|
+| `zero_skip` | `len(sample_bytes) == 0` | nothing to scan |
+| `adaptive_parallel` | zero fraction `< 0.3` | dense data → parallel workers |
+| `single_worker_skip` | zero fraction `>= 0.3` | mostly-zero sample → one worker with zero-skip |
+
+The threshold is a hard strict `< 0.3`, so exactly 0.30 (3 of 10 zero bytes)
+falls into `single_worker_skip`. It is a pure function: the same sample
+always yields the same op. Rationale: all-zero regions are cheap to skip and
+slow all workers down together, so they are better handled by one worker;
+dense data benefits from parallel workers.
+
+#### Entropy — Shannon, bits/byte
+
+`entropy(data: bytes) -> float` returns a reproducible Shannon entropy in
+**0..8 bits/byte** (8 = uniform over 256 byte values).
+
+- Empty input → `0.0`.
+- It counts byte frequencies with a dict, then computes
+  `-sum(p * log2(p))` over the distinct byte values using only `math.log2`
+  and exact integer counts.
+- Rounding: the caller rounds to a fixed precision; `calibrate()` rounds
+  entropy to **4 decimal places**.
+
+#### Parallel penalty accounting
+
+Parallelism is a cost, not a free win, when regions are mostly zero.
+
+- `parallel_penalty(workers: int, zero_frac: float) -> float` — returns a
+  penalty multiplier (≥ 1.0): `1.0 + max(0.0, (workers - 1) * zero_frac * 0.25)`.
+  Single worker always returns `1.0`; zero fraction `0.0` always returns
+  `1.0` (no penalty for dense data). Example: 4 workers, 80% zeros →
+  `1.0 + (4-1)*0.8*0.25 = 1.6`.
+
+- `account_penalty(op_name: str, workers: int, zero_frac: float) -> dict` —
+  per-operation, deterministic attribution into a **fresh dict** (no shared
+  mutable state). Keys: `op` (str), `workers` (int), `zero_frac`
+  (rounded 6 d.p.), `penalty_factor` (rounded 6 d.p.), `attribution` (string
+  like `opA:w4:zf0.500000`).
+
+- `aggregate_penalties(penalties: list) -> dict` — deterministic sorted
+  aggregation over a list of penalty records. Returns: `penalty_total` (sum
+  rounded 6 d.p.), `count` (int), `attribution` (`;`-joined sorted
+  attribution strings, so input order does not affect the result).
+
+The attribution string format is `op:wN:zf{6d}`; fields are fixed-width so
+records sort lexicographically in a deterministic, human-readable order.
+
+#### Fast-scan calibration — `calibrate(sample_path, workers) -> dict`
+
+`calibrate()` reads a sample file once and returns a reproducible
+calibration record, rounding **entropy**, **zero_frac**, and **penalty_factor**
+to **4 decimal places**:
+
+| key | type | meaning |
+|-----|------|---------|
+| `sample` | str | path passed in |
+| `bytes` | int | file size |
+| `entropy` | float | Shannon entropy, 4 d.p. |
+| `op` | str | `select_op` verdict |
+| `zero_frac` | float | zero fraction, 4 d.p. |
+| `penalty_factor` | float | `parallel_penalty(workers, zero_frac)`, 4 d.p. |
+
+Reproducibility guarantee: two calls with the same path and worker count
+return **identical dicts** (`cal1 == cal2`), byte-for-byte across runs.
+
+#### Direct I/O — configuration, fallback semantics
+
+Direct I/O is **opt-in** and **512-byte-aligned only**.
+
+- Configuration: `DIRECT_IO_ENABLED = os.environ.get("FIXFORMAT_DIRECT_IO", "0") == "1"`. Set to `1` to enable; any other value (including the default) disables it.
+- Alignment: `DIRECT_IO_ALIGN = 512`. The first 512-byte read must be a multiple of 512 bytes; anything else forces a buffered fallback.
+
+`open_direct(path, mode="rb")` returns a 3-tuple `(handle, used_direct, fallback_reason)`:
+
+| `used_direct` | `fallback_reason` | meaning |
+|---------------|-------------------|---------|
+| `True` | `None` | direct-mapped open succeeded |
+| `False` | `buffer_alignment_mismatch` | first 512-byte block not 512-aligned |
+| `False` | `direct_io_error:<Type>` | `OSError`/`ValueError`/`AttributeError` on open |
+| `False` | `direct_io_not_configured` | `DIRECT_IO_ENABLED` is off |
+| `False` | `buffered_fallback` | text mode (`"r"`, no `"b"`) — never direct |
+
+The handle is always a normal Python binary file object opened in `"rb"`
+mode (`"b"` must be in `mode`). Direct I/O is read-only: it never writes to
+a disk. The new `v6/performance/selftest_perf.py` selftest pins the
+calibration determinism, and `v6/performance/test_penalty.py` pins the
+penalty accounting determinism.
+
+#### Reproducibility guarantees
+
+- `select_op`, `entropy`, `parallel_penalty`, `account_penalty`,
+  `aggregate_penalties` are pure functions: same inputs → same outputs,
+  byte-for-byte, across runs.
+- `calibrate()` is deterministic: identical dicts across repeated runs.
+- `account_penalty()` returns a new `dict` per call; mutating one record
+  never affects another (asserted in `test_returns_new_dict_no_shared_state`).
+- All rounding is fixed-precision: entropy and `zero_frac` in `calibrate()`
+  use 4 decimal places; per-record `penalty_factor` uses 6; aggregation
+  rounds the total to 6.
+
+`
 ## How a search runs (menu options 1 and 3)
 
 - **STEP 1 - CHOOSE THE TARGET.** All physical disks are listed with their
@@ -245,3 +428,24 @@ internet needed.
   carving (extend while readable), carved-window triage (entropy + type:
   TEXT/BINARY/COMPRESSED/ZERO), organized output with browsable index.html,
   GitHub Release with embedded Python.
+- **v5.0.0** - Release 5: fast scan first (first 5% + last 5% inside a hard
+  5-minute budget, saves no files) so you know whether a full pass is worth
+  the hours; progressive 5% slices with a checkpoint after each; resume
+  (menu option 6) that continues a `recovered_*` folder from its recorded
+  offset. Every run writes `recovered_<disk>_<size>_<time>/` with a
+  `provenance.json` plus a browsable `organized_*/` (`by_extension/`,
+  `index.html`). Parallel phase 1 measured **3.0x** on a real 476.9 GiB image
+  and **4.3x** end-to-end on the synthetic fixture, and a JSON profile can
+  replace the extension menu. See `v5/RELEASE_NOTES_v5.0.0.md` and
+  `CHANGELOG.md` for details.
+
+## Download the release
+
+The v5.0.0 release assets are attached to the GitHub Release. Verify each file
+with the bundled SHA-256 manifest (`SHA256SUMS.txt`):
+
+| File | SHA-256 | Source |
+|------|---------|--------|
+| [v5.zip](https://github.com/eyadkashoom/fixformat/releases/download/v5.0.0/v5.zip) | `148ccc6e138152435ae33d5ae583a735c9ff7a1062d67de6a075ab18f4e4a969` | [v5.zip](https://github.com/eyadkashoom/fixformat/releases/download/v5.0.0/v5.zip) |
+| [python-embed.zip](https://github.com/eyadkashoom/fixformat/releases/download/v5.0.0/python-embed.zip) | `4acbed6dd1c744b0376e3b1cf57ce906f9dc9e95e68824584c8099a63025a3c3` | [python-embed.zip](https://github.com/eyadkashoom/fixformat/releases/download/v5.0.0/python-embed.zip) |
+| [SHA256SUMS.txt](https://github.com/eyadkashoom/fixformat/releases/download/v5.0.0/SHA256SUMS.txt) | (see file for the full manifest) | [SHA256SUMS.txt](https://github.com/eyadkashoom/fixformat/releases/download/v5.0.0/SHA256SUMS.txt) |
