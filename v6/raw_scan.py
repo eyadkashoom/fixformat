@@ -60,6 +60,22 @@ if _v6_self not in sys.path:
 import volume_gate
 import run_db
 
+# ---- K5 display layer (v6 UI theming engine, stdlib-only leaf module) -------
+# raw_scan routes status output through display so the full CLI_UX_SPEC §6
+# precedence is honored (NO_COLOR > non-TTY > TERM/CLICOLOR=0 > plain > FORCE_COLOR).
+# Guarded so a missing display.py can never break the scan entry.
+try:
+    import display as _display
+except Exception:
+    _display = None
+
+
+def _theme(role, text):
+    # Theme a status line; falls back to plain text if display is unavailable.
+    if _display is not None:
+        return _display.style(role, text)
+    return text
+
 IS_WINDOWS = os.name == "nt"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 SECTOR_SIZE = 512          # used for the sector counters
@@ -106,6 +122,8 @@ def fmt_hms(seconds):
 # ----------------------------------------------------------------------
 
 def _ansi_enabled():
+    if _display is not None:
+        return _display.color_enabled()
     if os.environ.get("NO_COLOR"):
         return False
     try:
@@ -3229,7 +3247,7 @@ def run_fast_flow(target, total):
 
     print()
     print("=" * 78)
-    print("SCANNING (hard stop after %s)" % fmt_hms(FAST_SCAN_BUDGET))
+    print(_theme("title", "SCANNING (hard stop after %s)" % fmt_hms(FAST_SCAN_BUDGET)))
     print("=" * 78)
     print("Press Ctrl+C to stop early - everything found so far is kept.")
     print("-" * 78)
@@ -3350,7 +3368,7 @@ def run_search_flow(target, total, mode="full"):
         blocked = probe.get("blocked") or []
         print("[GATE] verdict=%s | scannable=%d | blocked=%d | source=%s"
               % (verdict, len(scannable), len(blocked), target))
-        print(volume_gate.explain(probe))
+        print(_theme("info", volume_gate.explain(probe)))
         if verdict == "encrypted" and blocked:
             print()
             print("WARNING: the target appears fully BitLocker-encrypted.")
@@ -4116,7 +4134,7 @@ def choose_source(image_only=False):
 
 
 def main():
-    print("raw_scan.py v%s - raw sector signature scanner and disk imager" % VERSION)
+    print(_theme("info", "raw_scan.py v%s - raw sector signature scanner and disk imager" % VERSION))
     print("          (read-only for every disk it reads, fully offline)")
     print("script dir : %s" % SCRIPT_DIR)
     print()
