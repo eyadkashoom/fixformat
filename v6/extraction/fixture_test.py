@@ -1,4 +1,6 @@
 """Fixture: both modes pass representative synthetic fixtures."""
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from extraction.modes import MODE_EXTRACT, MODE_REPORT, extract_mode
 
 def test_both_modes():

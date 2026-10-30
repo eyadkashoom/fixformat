@@ -47,6 +47,15 @@ import sys
 import time
 from datetime import datetime
 
+# Portability (D15): the embedded python._pth does not put the script
+# directory on sys.path, so `python v6/raw_scan.py` failed on
+# `import volume_gate` when launched from the USB stick. Add this
+# folder first; read-only, stdlib-only.
+import os, sys
+_v6_self = os.path.dirname(os.path.abspath(__file__))
+if _v6_self not in sys.path:
+    sys.path.insert(0, _v6_self)
+
 # v6 Task 1: volume gate (pre-scan) + per-run DB (run_db)
 import volume_gate
 import run_db

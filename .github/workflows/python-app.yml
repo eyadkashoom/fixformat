@@ -30,7 +30,10 @@ jobs:
         flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
     - name: Run selftests (v1..v6)
       run: |
-        for v in v1 v2 v3 v4 v5 v6; do
-          echo "=== $v/selftest.py ==="
-          python $v/selftest.py
-        done
+                done
+    - name: Run v6 wiring + bundle tests
+      run: |
+        echo "=== v6/test_v6_wiring.py ==="
+        python v6/test_v6_wiring.py
+        echo "=== v6/test_v6_bundle.py ==="
+        python v6/test_v6_bundle.py
