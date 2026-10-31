@@ -253,7 +253,7 @@ def test_schema_and_run(conn, path):
     section("2. the run row")
     run_id = run_db.new_run(
         conn, tool_version="6.0-selftest", started="2026-10-29 10:00:00",
-        source="F:\\image_test.img", source_size=477 * GB,
+        source="D:\\image_test.img", source_size=477 * GB,
         mode="report-first", signature_set="v5-default (61 signatures)",
         workers=6, status="running", resume_offset=0, cap_policy="")
     check(run_id == 1, "new_run() returns the first run id (1)")
@@ -262,7 +262,7 @@ def test_schema_and_run(conn, path):
     for field, expected in (
             ("tool_version", "6.0-selftest"),
             ("started", "2026-10-29 10:00:00"),
-            ("source", "F:\\image_test.img"),
+            ("source", "D:\\image_test.img"),
             ("source_size", 477 * GB),
             ("mode", "report-first"),
             ("signature_set", "v5-default (61 signatures)"),
@@ -609,7 +609,7 @@ def test_plan(conn, run_id, fixture):
           "destinations_used lists the one folder it would write to")
 
     big = run_db.plan_extraction(conn, run_id, "everything",
-                                 {"F:/big": 900 * GB})
+                                 {"D:/big": 900 * GB})
     check(big["fits"] is True,
           "a 900 GB destination holds everything: fits True")
     check(big["planned_bytes"] == total_bytes and big["planned_files"] == 50,
@@ -627,10 +627,10 @@ def test_plan(conn, run_id, fixture):
           "and no more than 25% of it is planned")
 
     split = run_db.plan_extraction(conn, run_id, "everything",
-                                   [("C:/small", 3 * GB), ("F:/big", 900 * GB)])
+                                   [("C:/small", 3 * GB), ("D:/big", 900 * GB)])
     check(split["fits"] is True and split["planned_bytes"] == total_bytes,
           "split across two disks everything fits")
-    check(split["destinations_used"] == ["C:/small", "F:/big"],
+    check(split["destinations_used"] == ["C:/small", "D:/big"],
           "both destinations are used, in the order they were given")
     check(sum(d["planned_bytes"] for d in split["destinations"]) == split["planned_bytes"],
           "the per-destination bytes add up to the plan total")
@@ -638,7 +638,7 @@ def test_plan(conn, run_id, fixture):
           "no destination is planned beyond its own capacity")
 
     validated = run_db.plan_extraction(conn, run_id, "validated-only",
-                                       {"F:/big": 900 * GB})
+                                       {"D:/big": 900 * GB})
     check(validated["planned_bytes"] == total_validated,
           "validated-only plans exactly the validated bytes (%s)"
           % run_db.fmt_bytes(total_validated))
@@ -646,7 +646,7 @@ def test_plan(conn, run_id, fixture):
           "validated-only plans %d files" % validated_count)
 
     documents = run_db.plan_extraction(conn, run_id, "documents",
-                                       {"F:/big": 900 * GB})
+                                       {"D:/big": 900 * GB})
     doc_bytes = sum(c["length"] for c in fixture
                     if c["ext"] in run_db.DOC_EXTENSIONS)
     check(documents["planned_bytes"] == doc_bytes,
@@ -657,7 +657,7 @@ def test_plan(conn, run_id, fixture):
 
     custom = run_db.plan_extraction(conn, run_id,
                                     {"ext": [".jpg"], "min_length": 100 * MB},
-                                    {"F:/big": 900 * GB})
+                                    {"D:/big": 900 * GB})
     jpg_big = sum(c["length"] for c in fixture
                   if c["ext"] == ".jpg" and c["length"] >= 100 * MB)
     check(custom["planned_bytes"] == jpg_big,
@@ -685,7 +685,7 @@ def test_plan(conn, run_id, fixture):
           "with no destination nothing is planned (and nothing crashes)")
 
     try:
-        run_db.plan_extraction(conn, run_id, "only-the-good-ones", {"F:/big": 900 * GB})
+        run_db.plan_extraction(conn, run_id, "only-the-good-ones", {"D:/big": 900 * GB})
     except ValueError as error:
         check("only-the-good-ones" in str(error),
               "an unknown rule is refused and quoted back")
@@ -694,10 +694,10 @@ def test_plan(conn, run_id, fixture):
 
     # recording: the plan row and the destination bytes, so a partial
     # extraction stays explainable (plan 9d)
-    run_db.add_destination(conn, run_id, "F:/big", 900 * GB)
+    run_db.add_destination(conn, run_id, "D:/big", 900 * GB)
     run_db.add_destination(conn, run_id, "C:/small", 3 * GB)
     recorded = run_db.plan_extraction(conn, run_id, "validated-only",
-                                      {"F:/big": 900 * GB}, record=True)
+                                      {"D:/big": 900 * GB}, record=True)
     row = conn.execute("SELECT * FROM plan WHERE run_id = ? ORDER BY id DESC",
                        (run_id,)).fetchone()
     check(row is not None and row["rule"] == "validated-only"
@@ -705,7 +705,7 @@ def test_plan(conn, run_id, fixture):
           "record=True writes the rule and the planned bytes into plan")
     destination = conn.execute(
         "SELECT * FROM destination WHERE run_id = ? AND path = ?",
-        (run_id, "F:/big")).fetchone()
+        (run_id, "D:/big")).fetchone()
     check(destination["planned_bytes"] == recorded["planned_bytes"],
           "record=True stores planned_bytes on the destination it used")
     check(run_db.add_plan(conn, run_id, "documents", 123456) > 0,
