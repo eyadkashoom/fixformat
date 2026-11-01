@@ -1228,6 +1228,26 @@ def main():
         if "offset=0x%016X" % offset not in log_text:
             failures.append("results log is missing offset 0x%016X" % offset)
 
+    # v6 K5 display layer (t_811012b1): theme selection/fallback, progress
+    # callback contract, report schema/renderers. Runs the standalone
+    # v6/test_display_layer.py suite in-process on synthetic fixtures only;
+    # delegates to it so the contract lives in one file.
+    try:
+        import test_display_layer as _disp_tests
+    except Exception as _disp_import_exc:
+        failures.append("display-layer tests unimportable: %r" % (_disp_import_exc,))
+    else:
+        for _tfn in _disp_tests.TESTS:
+            try:
+                _tfn()
+            except AssertionError as _disp_exc:
+                failures.append("display-layer %s: %s" % (_tfn.__name__, _disp_exc))
+            except Exception as _disp_exc:
+                failures.append("display-layer %s UNEXPECTED %r"
+                                % (_tfn.__name__, _disp_exc))
+        if not getattr(_disp_tests, "TESTS", None):
+            failures.append("display-layer suite exported no tests")
+
     print()
     if failures:
         print("SELFTEST FAILED:")
@@ -1259,6 +1279,11 @@ def main():
     print("v6 K4 ANSI verified: helpers in raw_scan + volume_gate (enabled/disabled),")
     print("NO_COLOR/non-TTY/isatty-error invariants, explain() verdict colors with")
     print("strip-invariant text, blue() terminal wire-up, and no ESC in any file.")
+    print("v6 K5 display layer verified: theme selection/fallback (default/plain/")
+    print("high-contrast, NO_COLOR > non-TTY > TERM/CLICOLOR > plain > FORCE_COLOR),")
+    print("progress callbacks (TTY redraw vs non-TTY lines, states, throttling,")
+    print("width truncation, ASCII fallback), report md/csv/json + strict schema,")
+    print("contract fixtures, terminal edge cases, and no-ANSI-leak regressions.")
     for _skip in ansi_skips:
         print("ANSI note: %s" % _skip)
     shutil.rmtree(tmpdir, ignore_errors=True)
