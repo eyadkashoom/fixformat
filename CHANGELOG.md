@@ -2,6 +2,35 @@
 
 All notable changes to **fixformat** will be documented in this file.
 
+## [v7.0.1.2] - 2026-11-13
+
+Follow-up release over v7.0.1 (new tag so the published v7.0.1 assets stay
+untouched - no history rewrite).
+
+### Fixed
+- UnicodeEncodeError under a legacy console codepage: Arabic test output
+  crashed the `fat32_recovery` / `text_classify` / pipeline suites when
+  stdout is cp1252 (the Windows CI runner). The text-recovery modules and
+  their tests now reconfigure stdout/stderr to utf-8 with
+  `errors="replace"` at entry.
+
+### CI
+- Runner moved from ubuntu-latest to **windows-latest** (the tool is
+  Windows-only; ANSI/TTY assertions are meaningless on Linux).
+- Suite expanded from 4 to all 12 scripts (db/gate selftests, v6 steps67,
+  display layer, the four text-recovery suites).
+- `.flake8` excludes `archive/` - archived patch scripts contain a syntax
+  error that had been failing every CI run since 2026-11-01.
+
+### Changed
+- VERSION literals bumped to 7.0.1.2 (raw_scan, the three text modules,
+  gui shim/banner, wiring assertion).
+
+### Verified
+- Full 12/12 matrix green twice: default interpreter env AND with
+  `PYTHONIOENCODING=cp1252` (the exact CI condition that failed before).
+- GitHub Actions run on cbccff2: success on windows-latest.
+
 ## [v7.0.1] - 2026-11-01 (promoted to root) / pipeline 2026-11-13
 
 **Release 7**: the v6 bundle promoted to the repository root, plus a new

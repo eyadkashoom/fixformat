@@ -65,7 +65,7 @@ BS = chr(92)          # one backslash, built without a literal escape
 NL = chr(10)
 NUL_CHAR = chr(0)
 
-VERSION = "7.0.1"
+VERSION = "7.0.1.2"
 SECTOR = 512
 BOOT_SIG = bytes([0x55, 0xAA])
 

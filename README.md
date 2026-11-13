@@ -472,6 +472,10 @@ internet needed.
   entries), `text_classify.py` (entropy/printable gate, F1 1.000 on the
   corpus), `text_recovery_pipeline.py` (filesystem routing + raw-strings
   fallback). 247 pipeline assertions green on the embedded interpreter.
+- **v7.0.1.2** - Hot-fix release over v7.0.1: utf-8 stream reconfiguration
+  (Arabic output no longer crashes under a cp1252 console), CI moved to
+  windows-latest with the full 12-suite matrix, `.flake8` excludes the
+  archived patch scripts.
 
 ## Download the release
 
