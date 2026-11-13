@@ -2,6 +2,39 @@
 
 All notable changes to **fixformat** will be documented in this file.
 
+## [v7.0.3] - 2026-11-13
+
+Search, not just a gate. `text_search.py` ranks *where* language lives inside a
+binary blob and returns the top regions with byte offsets and scores.
+
+### Added
+- `text_search.py` - Layer 5: sliding-window n-gram perplexity search over raw
+  bytes. Decodes each window (strict UTF-8, else a UTF-16LE view), scores it with
+  the shipped trigram model, keeps windows above `DEFAULT_THRESHOLD`, merges the
+  overlapping ones into regions, and reports one row per region: offset, score,
+  length in bytes, encoding and a preview.
+- `test_text_search.py` - 22 assertions: per-encoding scoring, recall on three
+  planted regions (ASCII / Arabic UTF-8 / UTF-16LE) at known offsets, no false
+  positives on random / zero / compressed controls, region-merge behaviour, and
+  pinned calibration.
+
+### Fixed
+- Region length was measured in characters, so a 560-byte UTF-16LE plant looked
+  like 280 and fell below the 256-byte minimum. Lengths are now bytes.
+- A region's `offset` was being moved to its highest-scoring window, placing long
+  regions hundreds of bytes late. `offset` is now the region's own start.
+- A long window whose tail is random can decode as UTF-16LE garbage; scoring only
+  the first decodable length discarded real ASCII slightly shorter down. The best
+  score is now taken across all lengths.
+
+### Notes
+- Calibration on QA's fixture image: plants score -3.88 .. -3.19; a pure-random
+  4 KB control yields no region at all. `DEFAULT_THRESHOLD` (-4.20) sits between
+  the trigram floor (-4.42) and the weakest real plant.
+- Acceptance met: all three plants found within +/-64 bytes, 0 false positives.
+- **Documented gap:** the 476.9 GB real image is still untested (external disk
+  disconnected).
+
 ## [v7.0.2] - 2026-11-13
 
 Precision layer for text recovery: an n-gram filter that runs **after** the hard

@@ -51,7 +51,7 @@ def ck(cond, label):
 
 
 # 1. entry-point import
-ck(raw_scan.VERSION == "7.0.2", "raw_scan.VERSION == 7.0.2")
+ck(raw_scan.VERSION == "7.0.3", "raw_scan.VERSION == 7.0.3")
 ck(raw_scan.IS_WINDOWS is not None, "raw_scan constants parsed")
 ck(hasattr(raw_scan, "run_search_flow"), "run_search_flow present")
 ck(hasattr(volume_gate, "probe_source"), "gate self-bootstrap: probe_source importable")

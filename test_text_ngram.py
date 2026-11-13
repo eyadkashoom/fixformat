@@ -219,8 +219,8 @@ class TestThresholdsArePinned(unittest.TestCase):
         self.assertAlmostEqual(N.TRILP_FLOOR, -4.42, places=2)
         self.assertEqual(N.MODEL_K, 0.1)
 
-    def test_version_is_v7_0_2(self):
-        self.assertEqual(N.VERSION, "7.0.2")
+    def test_version(self):
+        self.assertEqual(N.VERSION, "7.0.3")
 
 
 if __name__ == "__main__":

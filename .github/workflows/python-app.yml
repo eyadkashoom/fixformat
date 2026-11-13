@@ -42,6 +42,7 @@ jobs:
         python test_fat32_recovery.py
         python test_text_classify.py
         python test_text_ngram.py
+        python test_text_search.py
         python test_text_recovery_pipeline.py
 
     # Release safeguards (v7.0.2 rules). These run on every push/PR, so a tag

@@ -18,3 +18,4 @@ scan_speed.json
 # Python
 __pycache__/
 *.pyc
+dist/

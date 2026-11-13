@@ -51,7 +51,7 @@ import math
 import re
 import sys
 
-VERSION = "7.0.2"
+VERSION = "7.0.3"
 
 __all__ = [
     "VERSION",

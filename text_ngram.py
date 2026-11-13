@@ -56,7 +56,7 @@ import math
 import os
 from collections import Counter
 
-VERSION = "7.0.2"
+VERSION = "7.0.3"
 
 __all__ = [
     "VERSION",

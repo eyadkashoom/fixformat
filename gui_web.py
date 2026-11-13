@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-fixformat v7.0.2 — local web GUI (stdlib only, no tkinter).
+fixformat v7.0.3 — local web GUI (stdlib only, no tkinter).
 Serves a single-page interface at http://localhost:8787/
 and proxies scan() calls to the existing v7 backend modules.
 """
@@ -182,7 +182,7 @@ def main():
     host = "127.0.0.1"
     port = 8787
     server = HTTPServer((host, port), Handler)
-    print(f"fixformat v7.0.2 GUI  ->  http://{host}:{port}/", flush=True)
+    print(f"fixformat v7.0.3 GUI  ->  http://{host}:{port}/", flush=True)
     print("Press Ctrl+C to stop.", flush=True)
     try:
         server.serve_forever()
