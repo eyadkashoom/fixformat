@@ -1295,6 +1295,85 @@ def main():
         print("v7 Phase 0 GUI module verified: gui + gui_web importable.")
     except Exception as _ge:
         print("GUI module check failed: %s" % _ge)
+    # v7 Phase 1: text recovery (NTFS $MFT parser) on a synthetic image
+    try:
+        import test_text_recovery as _tr_tests
+        import text_recovery as _tr
+        _img, _meta = _tr_tests.build_ntfs_image()
+        _img_path = os.path.join(tmpdir, "phase1_ntfs.img")
+        with open(_img_path, "wb") as _fh:
+            _fh.write(_img)
+        _src = _tr.Source(_img_path)
+        try:
+            _boot = _tr.parse_boot_sector(_src.read(0, 512))
+            _layout = _tr.mft_layout(_src, _boot)
+            _cands = _tr.scan_deleted(_src, _boot)
+            _names = set(c["name"] for c in _cands)
+            assert _boot["cluster_size"] == 4096, "phase1 cluster size"
+            assert _layout["record_count"] == 12, "phase1 record count"
+            assert "deleted.txt" in _names, "phase1 deleted.txt"
+            assert "deleted_frag.txt" in _names, "phase1 deleted_frag.txt"
+            assert "live.txt" not in _names, "phase1 live.txt excluded"
+            _cand = [c for c in _cands if c["name"] == "deleted.txt"][0]
+            _p = _tr.carve_candidate(_src, _layout, _cand,
+                                     os.path.join(tmpdir, "phase1_out"))
+            with open(_p, "rb") as _fh:
+                assert _fh.read() == _meta["del_content"], "phase1 carved bytes"
+        finally:
+            _src.close()
+        print("v7 Phase 1 text recovery verified: NTFS $MFT parser reads deleted")
+        print("records (names, sizes, cluster runs) and carves exact bytes.")
+    except Exception as _te:
+        failures.append("v7 Phase 1 text recovery: %r" % (_te,))
+    # v7 Phase 2: FAT32 deleted-entry recovery on a synthetic image
+    try:
+        import test_fat32_recovery as _fat_tests
+        import fat32_recovery as _fr
+        _fimg, _fmeta = _fat_tests.build_fat32_image()
+        _fpath = os.path.join(tmpdir, "phase2_fat.img")
+        with open(_fpath, "wb") as _fh:
+            _fh.write(_fimg)
+        _fsum = _fr.recover_fat(_fpath)
+        _fnames = set(c["name"] for c in _fsum["candidates"])
+        assert _fsum["ok"], "phase2 fat32 ok"
+        assert _fsum["deleted"] == 7, "phase2 deleted count %d" % _fsum["deleted"]
+        assert "تقرير مبيعات.txt" in _fnames, "phase2 arabic LFN recovered"
+        print("v7 Phase 2 FAT32 recovery verified: deleted entries (8.3 +")
+        print("Arabic LFN), chain walk, loop/truncation flags all correct.")
+    except Exception as _fe:
+        failures.append("v7 Phase 2 fat32 recovery: %r" % (_fe,))
+    # v7 Phase 3: text classification gate + caps on synthetic fixtures
+    try:
+        import text_classify as _tc
+        _pos = ("السلام عليكم this is realistic prose for the gate " * 40).encode("utf-8")
+        _neg = os.urandom(8192)
+        _dpos = _tc.classify(_pos)
+        _dneg = _tc.classify(_neg)
+        assert _dpos["is_text"], "phase3 real text must pass the gate"
+        assert not _dneg["is_text"], "phase3 random must fail the gate"
+        assert _tc.entropy_bits_per_byte(_neg) > 4.0, "phase3 random entropy"
+        print("v7 Phase 3 text classification verified: entropy/printable gate,")
+        print("UTF-8 Arabic accepted, random and base64 traps rejected.")
+    except Exception as _ce:
+        failures.append("v7 Phase 3 text classify: %r" % (_ce,))
+    # v7 Phase 4: hybrid pipeline routes by filesystem, strings fallback
+    try:
+        import text_recovery_pipeline as _tp
+        _ptext = ("السلام عليكم this is realistic prose for the gate " * 40).encode("utf-8")
+        assert _tp.detect_filesystem(_img_path) == "ntfs", "phase4 ntfs detect"
+        assert _tp.detect_filesystem(_fpath) == "fat32", "phase4 fat32 detect"
+        _psum = _tp.recover(_img_path, out_dir=os.path.join(tmpdir, "phase4_out"))
+        assert _psum["ok"] and _psum["metadata"]["deleted"] == 5, "phase4 ntfs route"
+        assert _psum["strings"] is None, "phase4 no strings fallback when metadata hit"
+        _mix = os.path.join(tmpdir, "phase4_mix.bin")
+        with open(_mix, "wb") as _fh:
+            _fh.write(os.urandom(4096) + _ptext + os.urandom(4096))
+        _ssum = _tp.recover(_mix, out_dir=None, strings=True)
+        assert len(_ssum["strings"]["candidates"]) == 1, "phase4 strings fallback"
+        print("v7 Phase 4 pipeline verified: filesystem routing, strings")
+        print("fallback with Layer-3 gate, metadata-vs-strings report merge.")
+    except Exception as _pe:
+        failures.append("v7 Phase 4 pipeline: %r" % (_pe,))
     shutil.rmtree(tmpdir, ignore_errors=True)
     sys.exit(0)
 

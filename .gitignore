@@ -5,6 +5,8 @@ python-embed.zip
 
 # Run-time output of the scanner
 recovered/
+recovered_*/
+organized_*/
 search_results.txt
 recovery_report.txt
 *.img

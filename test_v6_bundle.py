@@ -10,8 +10,8 @@ Covers, with happy paths + edge cases, using synthetic fixtures only:
           (workspace extraction/modes.py AND run_db._mode canonicalization)
   step 4  plan screen (workspace plan_screen.py via public run_db API)
   step 5  reports (run_db.write_report + workspace reports_integration.py)
-  step 6  validators (v6/validators.py: jpeg/png/pdf/zip/sqlite)
-  step 7  assembly (v6/assembly.py: 0/1/2/3 fragments, gap bound)
+  step 6  validators (validators.py: jpeg/png/pdf/zip/sqlite)
+  step 7  assembly (assembly.py: 0/1/2/3 fragments, gap bound)
   step 8  adaptive ops (performance/operations.select_op)
   step 9  entropy (operations.entropy)
   step 10 parallel penalty (operations.parallel_penalty)
@@ -33,9 +33,9 @@ import sqlite3
 import sys
 import tempfile
 
-FIX = r"C:\Users\eyad\Documents\Codex\2026-09-27\fixformat\v6"
-WS4 = os.path.join(FIX, "")  # consolidated into repo v6/
-WS8 = os.path.join(FIX, "")  # consolidated into repo v6/
+FIX = os.path.dirname(os.path.abspath(__file__))  # repo root (v6 content promoted here in 85d0240)
+WS4 = os.path.join(FIX, "")  # consolidated into repo root
+WS8 = os.path.join(FIX, "")  # consolidated into repo root
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, FIX)
 sys.path.insert(0, HERE)

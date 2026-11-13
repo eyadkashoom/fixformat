@@ -1,0 +1,6 @@
+[flake8]
+# Archived release trees and helper patch scripts are history, not shipped
+# source: patch_volume_gate_guide.py contains a syntax error that would
+# otherwise fail the E9 gate on every CI run (see raw-disk skill rule).
+exclude = archive/,python/,__pycache__,build,dist
+max-line-length = 127

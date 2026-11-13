@@ -31,6 +31,14 @@ jobs:
     - name: Run selftests
       run: |
         python selftest.py
+        python db_selftest.py
+        python gate_selftest.py
         python test_v6_bundle.py
         python test_v6_wiring.py
+        python test_v6_steps67.py
         python test_v7_validators.py
+        python test_display_layer.py
+        python test_text_recovery.py
+        python test_fat32_recovery.py
+        python test_text_classify.py
+        python test_text_recovery_pipeline.py
