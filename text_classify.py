@@ -481,7 +481,17 @@ def extract_text_runs(data, min_run=MIN_RUN):
 # 7) CLI demo — the ONLY file I/O in this module, __main__-guarded
 # ---------------------------------------------------------------------------
 
+def _ensure_utf8_streams():
+    """Never crash on Arabic output under a legacy console codepage."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
+
 def main(argv=None):
+    _ensure_utf8_streams()
     """Read one file path and print classify() + run stats. Demo only."""
     argv = list(sys.argv[1:] if argv is None else argv)
     if not argv:

@@ -27,6 +27,12 @@ import os
 import re
 import shutil
 import sys
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
 import tempfile
 import time
 

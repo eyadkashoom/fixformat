@@ -87,6 +87,15 @@ def _realigned(data):
     return data
 
 
+def _ensure_utf8_streams():
+    """Never crash on Arabic output under a legacy console codepage."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
+
 def _read_vbr(source_path, offset=0):
     with open(source_path, "rb") as fh:
         fh.seek(int(offset))
@@ -397,6 +406,7 @@ def _print_summary(summary):
 
 
 def main(argv=None):
+    _ensure_utf8_streams()
     argv = list(sys.argv if argv is None else argv)
     args = argv[1:]
     if not args or "--help" in args or "-h" in args:

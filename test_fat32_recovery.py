@@ -16,6 +16,12 @@ No real disk is touched: the image is a regular file under tempfile.mkdtemp.
 import os
 import shutil
 import sys
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
 import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))

@@ -121,6 +121,15 @@ def _s8(value):
     return value - 256 if value >= 128 else value
 
 
+def _ensure_utf8_streams():
+    """Never crash on Arabic output under a legacy console codepage."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
+
 def device_path(drive):
     """Build a Windows raw-device path: two backslashes, dot, backslash, drive.
 
@@ -991,6 +1000,7 @@ def _print_summary(summary):
 
 
 def main(argv=None):
+    _ensure_utf8_streams()
     argv = list(sys.argv if argv is None else argv)
     args = argv[1:]
     if not args or "--help" in args or "-h" in args:

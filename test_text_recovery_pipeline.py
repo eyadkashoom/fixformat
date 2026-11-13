@@ -13,6 +13,12 @@ disks, no network, stdlib only.
 import base64
 import os
 import sys
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
 import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))

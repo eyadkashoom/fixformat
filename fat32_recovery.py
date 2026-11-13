@@ -126,6 +126,15 @@ def _u32(buf, off):
     return int.from_bytes(buf[off:off + 4], "little") if 0 <= off and off + 4 <= len(buf) else 0
 
 
+def _ensure_utf8_streams():
+    """Never crash on Arabic output under a legacy console codepage."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
+
 def device_path(drive):
     """Build a Windows raw-device path: two backslashes, dot, backslash, drive.
 
@@ -965,6 +974,7 @@ def _print_summary(summary):
 
 
 def main(argv=None):
+    _ensure_utf8_streams()
     argv = list(sys.argv if argv is None else argv)
     args = argv[1:]
     if not args or "--help" in args or "-h" in args:
