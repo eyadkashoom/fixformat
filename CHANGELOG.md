@@ -2,6 +2,45 @@
 
 All notable changes to **fixformat** will be documented in this file.
 
+## [v7.0.2] - 2026-11-13
+
+Precision layer for text recovery: an n-gram filter that runs **after** the hard
+gate (entropy + printable + length) and rejects runs that decode as bytes rather
+than as language.
+
+### Added
+- `text_ngram.py` - Layer 4 of the text-recovery pipeline. Five ordered checks:
+  decode-first (strict UTF-8, else a UTF-16LE view), a NUL-share cap for
+  non-UTF-16LE buffers, longest-single-character-run as a *fraction* of the
+  buffer, whitespace share, and a mean trigram log-probability against a shipped
+  add-k model.
+- `text_ngram_corpus.txt` - the shipped training corpus (English prose, Arabic
+  prose, Python and JavaScript), deliberately disjoint from the test fixtures
+  and from the calibration set so the measured separation is honest.
+- `test_text_ngram.py` - 26 assertions: decode paths, every negative class, the
+  positive classes (English / Arabic / Python / Markdown / UTF-16LE), real
+  repository sources, contract behaviour, and pinned thresholds.
+- `scan_strings()` in the pipeline now records `ngram_rejected` and an `ngram`
+  score per candidate.
+
+### Fixed
+- **ZIP-with-comment false positive.** A structurally valid ZIP whose comment is
+  a long run of one byte passes the hard gate (entropy 1.08, printable 0.81) and
+  was carved as text. It is now rejected: 79% of the buffer is a single
+  character. This is the exact case QA's `qa_ngram_negatives.py` reproduced.
+- Layer 4 initially filtered the untrimmed buffer, which rejected the very runs
+  the progressive trim had just rescued. It now scores `payload`.
+
+### Notes
+- The filter only ever **rejects**. It never promotes a run the gate refused, so
+  gate recall is unchanged.
+- Measured separation, 15 cases, 0 misclassified: whitespace 0.234 (min
+  positive) vs 0.200 (max negative); longest-run fraction 0.009 vs 0.002;
+  trigram floor -4.42 for unseen text.
+- **Documented gap:** this is a binary accept/reject filter, not the full
+  perplexity *ranking* the guide describes. Ranking remains open.
+- Not yet verified against the 476.9 GB real image (external disk disconnected).
+
 ## [v7.0.1.2] - 2026-11-13
 
 Follow-up release over v7.0.1 (new tag so the published v7.0.1 assets stay

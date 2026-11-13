@@ -97,7 +97,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 SECTOR_SIZE = 512          # used for the sector counters
 DEVICE_ALIGNMENT = 4096    # Windows raw-device reads must be aligned to this
 GB = 1024.0 ** 3
-VERSION = "7.0.1.2"
+VERSION = "7.0.2"
 
 # Every text signature is searched in all of these encodings.
 # Windows stores text as UTF-16-LE; UTF-16-BE is opt-in, because every BE

@@ -49,6 +49,7 @@ except ImportError:  # pragma: no cover - embedded interpreter runs from root
     import text_recovery
 import fat32_recovery
 import text_classify
+import text_ngram
 
 __all__ = [
     "detect_filesystem", "scan_strings", "recover",
@@ -184,6 +185,25 @@ def scan_strings(source_path, offset=0, length=None, out_dir=None,
         if not decision["is_text"] or decision["confidence"] < min_confidence:
             summary["rejected"] += 1
             return
+        # Layer 4: n-gram filter. The hard gate above is recall-oriented, so a
+        # valid ZIP whose comment is a long run of one byte clears it (entropy
+        # 1.08, printable 0.81). This filter rejects it as language without
+        # touching the gate's own numbers.
+        #
+        # `payload`, not `data`: the progressive trim above may have cut random
+        # bytes that valid-UTF-8 noise stitched onto the edges of a real run.
+        # Filtering the untrimmed buffer would reject the very runs the trim
+        # just rescued.
+        ng = text_ngram.ngram_filter(payload)
+        if not ng["is_text"]:
+            summary["rejected"] += 1
+            summary["ngram_rejected"] = summary.get("ngram_rejected", 0) + 1
+            return
+        decision = dict(decision)
+        decision["confidence"] = round(min(0.99, decision["confidence"]
+                                           * 0.5 + ng["confidence"] * 0.5), 3)
+        decision["reason"] = "%s; layer4: %s" % (decision["reason"],
+                                                 ng["reason"])
         cand = {
             "kind": "strings",
             "start": frag["start"],
@@ -194,6 +214,7 @@ def scan_strings(source_path, offset=0, length=None, out_dir=None,
             "entropy": round(decision["entropy"], 3),
             "printable": round(decision["printable"], 3),
             "markers": round(decision["markers"], 3),
+            "ngram": round(ng["trigram"], 3),
             "reason": decision["reason"],
             "carvable": True,
             "name": None,

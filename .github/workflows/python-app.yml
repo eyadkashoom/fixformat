@@ -41,4 +41,17 @@ jobs:
         python test_text_recovery.py
         python test_fat32_recovery.py
         python test_text_classify.py
+        python test_text_ngram.py
         python test_text_recovery_pipeline.py
+
+    # Release safeguards (v7.0.2 rules). These run on every push/PR, so a tag
+    # can never be created that disagrees with the VERSION in the code, and the
+    # shipped archive can never come from a stale working tree.
+    - name: Version gate - every VERSION literal must agree
+      run: |
+        python -c "import raw_scan, text_classify, text_ngram, text_recovery, fat32_recovery; vs=[raw_scan.VERSION, text_classify.VERSION, text_ngram.VERSION, text_recovery.VERSION, fat32_recovery.VERSION]; print('VERSION literals:', vs); assert len(set(vs))==1, 'VERSION literals disagree: %s' % vs; print('version gate OK:', vs[0])"
+
+    - name: Version gate - tag must equal VERSION
+      if: startsWith(github.ref, 'refs/tags/v')
+      run: |
+        python -c "import os, raw_scan; tag=os.environ['GITHUB_REF_NAME'].lstrip('v'); print('tag=%s code=%s' % (tag, raw_scan.VERSION)); assert tag==raw_scan.VERSION, 'tag %s != VERSION %s' % (tag, raw_scan.VERSION)"

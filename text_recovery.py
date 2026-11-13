@@ -55,7 +55,7 @@ BS = chr(92)          # one backslash, built without a literal escape
 NL = chr(10)
 NUL_CHAR = chr(0)
 
-VERSION = "7.0.1.2"
+VERSION = "7.0.2"
 SECTOR = 512
 NTFS_OEM = b"NTFS    "
 MFT_MAGIC = b"FILE"

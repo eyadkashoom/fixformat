@@ -1,0 +1,154 @@
+Text corpus for the Layer 4 n-gram model.
+
+This file is the shipped training corpus for text_ngram.default_model(). It is
+deliberately disjoint from the test fixtures in test_text_ngram.py and from the
+calibration set (the repository's own source files), so the measured separation
+is honest rather than memorised.
+
+It contains English prose, Arabic prose and source code, because a model trained
+on English alone scores Arabic below the floor and would reject real Arabic
+recovery output - the same failure mode that printable_ratio had before the
+decode-aware fix.
+
+================================================================================
+ENGLISH PROSE
+================================================================================
+
+The recovery tool reads the source in large blocks and searches for configured
+signatures, reporting the exact byte offset and the sector number of every hit
+that it finds. Because the source is opened for reading only, nothing on the
+damaged volume can be modified while the analysis is running, and the scan can
+be interrupted at any point without losing the results gathered so far.
+
+A signature is only a starting point. A block of bytes that happens to match a
+known header is not proof that a whole file survived, because the bytes after
+the header may belong to a different file entirely. Validating the structure
+after the match is what separates a recovered file from a coincidental one.
+
+When a partition is encrypted, carving its payload produces false positives
+only. Ciphertext has no headers, no file system structure and no deleted
+records, so every match is a signature landing on random bytes at the rate that
+chance predicts. The operator should supply the recovery key instead.
+
+The scanner reports progress as data read, sectors covered, remaining bytes and
+an estimated time to completion. The estimate is derived from the throughput
+measured on this machine, and it says so when no measurement exists yet rather
+than presenting a guess as a fact.
+
+Recovery is organised into a recovered folder that holds the raw carved windows
+and an organised folder that groups them by extension, so a person can browse
+the results without reading the log. A provenance file records which signature
+set and which version of the tool produced the folder.
+
+A resumed run continues the same folder rather than starting a new one, and its
+provenance holds the total for the folder rather than the numbers of the latest
+pass alone. That distinction matters when a run is stopped halfway and continued
+a week later, because the totals must describe the whole recovery.
+
+Free space is checked before anything is written. Writing recovered data onto
+the disk being recovered can overwrite the very data the scan is looking for, so
+the destination is validated with a probe file before the scan begins, and a
+destination on the same physical disk is refused unless the operator explicitly
+overrides the refusal.
+
+Text files have no magic bytes. A plain text document is only a sequence of
+characters, so a scanner that looks for known headers will never find a deleted
+text file at all. Recovering text needs a different approach: look for regions
+that decode as language, then judge whether those regions are really prose or
+merely compressed bytes that happen to be printable.
+
+Compressed data is the hardest case to reject, because a stream of compressed
+bytes can be short, can be mostly printable and can have low entropy when it
+contains long runs of a repeated value. Structure is the reliable signal: real
+prose has word gaps, and a file that is a quarter padding is not prose.
+
+================================================================================
+ARABIC PROSE
+================================================================================
+
+تقوم الأداة بمسح صورة القرص في كتل كبيرة ثم تسجل موضع كل توقيع بدقة. ولأن
+المصدر يفتح للقراءة فقط فلا يمكن تعديل أي بيانات على القرص التالف أثناء
+التحليل، ويمكن ايقاف المسح في اي لحظة دون فقدان النتائج التي تم جمعها.
+
+التوقيع ليس نهاية المطاف. كتلة من البايتات تطابق ترويسة معروفة لا تثبت ان
+ملفا كاملا قد نجا، لان البايتات التي تلي الترويسة قد تعود الى ملف اخر تماما.
+التحقق من البنية بعد المطابقة هو ما يميز الملف المستعاد عن المطابقة العارضة.
+
+عندما يكون القسم مشفرا فان استخراج محتواه ينتج نتائج ايجابية كاذبة فقط، لان
+النص المشفر لا يحتوي على ترويسات ولا بنية نظام ملفات ولا سجلات محذوفة، لذلك
+تكون كل مطابقة مجرد توقيع يقع على بايتات عشوائية. على المشغل ان يقدم مفتاح
+الاستعادة بدلا من ذلك.
+
+الملفات النصية لا تملك بايتات سحرية. المستند النصي ليس الا سلسلة من الاحرف،
+لذلك لن يعثر ماسح يبحث عن ترويسات معروفة على ملف نصي محذوف اطلاقا. استعادة
+النص تحتاج نهجا مختلفا: البحث عن مناطق تفك الى لغة، ثم الحكم هل هذه المناطق
+نص حقيقي ام مجرد بايتات مضغوطة تبدو قابلة للطباعة.
+
+البيانات المضغوطة اصعب حالة في الرفض، لان تيارا من البايتات المضغوطة يمكن ان
+يكون قصيرا ويمكن ان يكون اغلبه قابلا للطباعة ويمكن ان تكون قيمة الانتروبيا
+فيه منخفضة عندما يحتوي على تكرار طويل لقيمة واحدة. البنية هي الاشارة الموثوقة:
+النص الحقيقي يحتوي على مسافات بين الكلمات، والملف الذي يبلغ ربعه حشوا ليس نصا.
+
+================================================================================
+SOURCE CODE (Python)
+================================================================================
+
+import hashlib
+import os
+import struct
+
+
+def carve_window(reader, offset, length, out_dir):
+    """Write one carved window and return its path."""
+    data = reader.read_range(offset, offset + length)
+    if not data:
+        return ""
+    os.makedirs(out_dir, exist_ok=True)
+    name = "window_0x%016X.bin" % offset
+    path = os.path.join(out_dir, name)
+    with open(path, "wb") as fh:
+        fh.write(data)
+    return path
+
+
+class Progress(object):
+    """Tracks how much of the source has been read."""
+
+    def __init__(self, total):
+        self.total = total
+        self.done = 0
+
+    def advance(self, n=1):
+        self.done += n
+        if not self.total:
+            return 0.0
+        return 100.0 * self.done / self.total
+
+    def remaining(self):
+        return max(0, self.total - self.done)
+
+================================================================================
+SOURCE CODE (JavaScript)
+================================================================================
+
+function formatBytes(value) {
+  if (!value) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let index = 0;
+  let n = value;
+  while (n >= 1024 && index < units.length - 1) {
+    n /= 1024;
+    index += 1;
+  }
+  return n.toFixed(2) + " " + units[index];
+}
+
+export function groupByExtension(files) {
+  const out = new Map();
+  for (const file of files) {
+    const ext = file.name.split(".").pop().toLowerCase();
+    if (!out.has(ext)) out.set(ext, []);
+    out.get(ext).push(file);
+  }
+  return out;
+}
