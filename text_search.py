@@ -309,6 +309,29 @@ def score_window(window, model=None, min_chars=MIN_REGION_BYTES, stop_at=None):
     return best
 
 
+def _absorb(regions, cur, start, score, enc, wend, step):
+    """Add one above-threshold window to the region being built.
+
+    Same rule as `_merge_regions` - windows within one step join the current
+    region - but applied on the fly so the caller never holds every window.
+
+    `start` is the region's own start and is never moved to the best window:
+    `offset` must be where the region begins, or a caller matching a known offset
+    would be placed hundreds of bytes late.
+    """
+    nbytes = wend - start
+    if cur is not None and start <= cur["end"] + step:
+        if start + nbytes > cur["end"]:
+            cur["end"] = start + nbytes
+        if score > cur["best"]:
+            cur.update(best=score, enc=enc, win=(start, nbytes))
+        return cur
+    if cur is not None:
+        regions.append(cur)
+    return dict(start=start, best=score, enc=enc, win=(start, nbytes),
+                end=start + nbytes)
+
+
 def _merge_regions(scored, step):
     """Collapse overlapping above-threshold windows into one region each.
 
@@ -381,7 +404,11 @@ def search(data, top_n=10, threshold=None, window=None, step=None,
     if not runs:
         return []
 
-    scored = []
+    # Regions are merged as the scan advances, not after it. Holding one entry per
+    # above-threshold window made a 100 MiB text file cost 386 MiB of RSS (1.6M
+    # tuples); a region list is O(regions), which is what the caller asked for.
+    regions = []
+    cur = None
     run_idx = 0
     cur_key = None          # only the current chunk is kept alive: windows advance
     cur_scorer = None       # monotonically, so a newer chunk never needs an older one
@@ -422,8 +449,7 @@ def search(data, top_n=10, threshold=None, window=None, step=None,
                     # 'ascii' is an internal fast-path label; the public encoding
                     # of plain ASCII text is 'utf-8' (it is a valid UTF-8 stream).
                     enc = "utf-8" if scorer.mode == "ascii" else scorer.mode
-                    scored.append((start, score, enc,
-                                   (start, wend - start), wend - start))
+                    cur = _absorb(regions, cur, start, score, enc, wend, step)
                 continue
         score, enc, text = score_window(data[start:wend], model,
                                         stop_at=threshold)
@@ -432,11 +458,13 @@ def search(data, top_n=10, threshold=None, window=None, step=None,
         # Byte length, not character length: a UTF-16LE region is half as many
         # characters as bytes, so measuring characters would make a real 560-byte
         # plant look like 280 and drop it below a 256-byte minimum.
-        scored.append((start, score, enc, (start, wend - start),
-                       len(data[start:wend])))
+        cur = _absorb(regions, cur, start, score, enc, wend, step)
+
+    if cur is not None:
+        regions.append(cur)
 
     hits = []
-    for region in _merge_regions(scored, step):
+    for region in regions:
         length = region["end"] - region["start"]
         if length < min_run:
             continue
