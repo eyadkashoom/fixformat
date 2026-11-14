@@ -55,7 +55,8 @@ BS = chr(92)          # one backslash, built without a literal escape
 NL = chr(10)
 NUL_CHAR = chr(0)
 
-VERSION = "7.0.3"
+from version import VERSION as VERSION  # single source: version.py
+# Re-exported under the module's own name so `module.VERSION` keeps working.
 SECTOR = 512
 NTFS_OEM = b"NTFS    "
 MFT_MAGIC = b"FILE"

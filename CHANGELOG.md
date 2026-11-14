@@ -64,6 +64,18 @@ plus a hard recall fix driven by a committed **golden fixture set**
   the preview. The guard now matches a real NUL, and leading replacement
   characters are dropped (damage inside the text is still shown).
 
+### Changed
+- The version number has one source: `version.py`. The six shipped modules
+  import it instead of repeating `VERSION = "7.0.3"`, the three tests that
+  pinned the string now compare against it, and `scripts/check_version.py`
+  replaces the two inline CI gates. On a tagged build that gate also requires
+  the git tag and the newest `## [vX.Y.Z]` heading in this file to name the same
+  version - artefacts the code does not generate, so a wrong number cannot pass
+  by agreeing with itself.
+- `perf/compare_refs.py` loads a historical revision with a `version` stub
+  carrying that revision's own number. Without it, an old `text_search.py`
+  would import this tree's `version.py` and report the new version for the
+  baseline.
 ### Performance
 - NUL-rich input without text: 20.3 → 14.9 MiB/s on the 10 MiB mixed corpus
   (still above the 10 MiB/s acceptance target; the cost and how to reclaim it

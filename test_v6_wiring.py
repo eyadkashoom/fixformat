@@ -30,6 +30,7 @@ if _PARENT not in sys.path:
     sys.path.insert(0, _PARENT)
 
 import raw_scan  # noqa: E402  -- this is the regression under test
+import version  # noqa: E402
 import run_db  # noqa: E402
 import volume_gate  # noqa: E402
 import validators  # noqa: E402
@@ -51,7 +52,9 @@ def ck(cond, label):
 
 
 # 1. entry-point import
-ck(raw_scan.VERSION == "7.0.3", "raw_scan.VERSION == 7.0.3")
+# Internal consistency: every shipped module reports the one string in
+# version.py. A bump edits version.py and nothing else.
+ck(raw_scan.VERSION == version.VERSION, "raw_scan.VERSION == version.VERSION")
 ck(raw_scan.IS_WINDOWS is not None, "raw_scan constants parsed")
 ck(hasattr(raw_scan, "run_search_flow"), "run_search_flow present")
 ck(hasattr(volume_gate, "probe_source"), "gate self-bootstrap: probe_source importable")

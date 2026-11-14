@@ -20,10 +20,12 @@ over trim cuts.
 import importlib.util
 import os
 import random
+import re
 import subprocess
 import sys
 import tempfile
 import time
+import types
 import zlib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -32,6 +34,21 @@ sys.path.insert(0, ROOT)
 import text_search as NEW  # noqa: E402
 
 DEFAULT_BASELINE = "v7.0.3"
+
+
+def _ref_version(ref):
+    """The version string of `ref`, read from that ref, not from this tree."""
+    for name in ("version.py", "raw_scan.py"):
+        try:
+            src = subprocess.run(
+                ["git", "-C", ROOT, "show", "%s:%s" % (ref, name)],
+                capture_output=True, text=True, check=True).stdout
+        except subprocess.CalledProcessError:
+            continue
+        found = re.search(r'^VERSION\s*=\s*"([^"]+)"', src, re.MULTILINE)
+        if found:
+            return found.group(1)
+    return None
 
 
 def load_baseline(ref):
@@ -46,7 +63,21 @@ def load_baseline(ref):
     spec = importlib.util.spec_from_file_location("text_search_base", tmp)
     mod = importlib.util.module_from_spec(spec)
     sys.modules["text_search_base"] = mod
-    spec.loader.exec_module(mod)
+    # Since the modules import `version`, executing an old revision would
+    # resolve `version` to THIS working tree and report the new number for the
+    # baseline. Swap in a stub carrying the baseline's own version for the
+    # duration of the load, then restore whatever was there.
+    stub = types.ModuleType("version")
+    stub.VERSION = _ref_version(ref) or NEW.VERSION
+    previous = sys.modules.get("version")
+    sys.modules["version"] = stub
+    try:
+        spec.loader.exec_module(mod)
+    finally:
+        if previous is not None:
+            sys.modules["version"] = previous
+        else:
+            sys.modules.pop("version", None)
     return mod, sha
 
 

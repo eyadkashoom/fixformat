@@ -18,6 +18,7 @@ import zlib
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import text_ngram as N  # noqa: E402
+import version  # noqa: E402
 
 
 def shake(seed, n=2048):
@@ -220,7 +221,11 @@ class TestThresholdsArePinned(unittest.TestCase):
         self.assertEqual(N.MODEL_K, 0.1)
 
     def test_version(self):
-        self.assertEqual(N.VERSION, "7.0.3")
+        # The number lives in version.py; this asserts the module reports that
+        # one string instead of pinning a literal that must be edited by hand
+        # (and that used to be missed on a bump).
+        self.assertEqual(N.VERSION, version.VERSION)
+        self.assertRegex(N.VERSION, r"^\d+\.\d+\.\d+$")
 
 
 if __name__ == "__main__":

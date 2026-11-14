@@ -20,6 +20,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import text_search as S  # noqa: E402
+import version  # noqa: E402
 
 PLANT_ASCII = ("SEARCHMARK ASCII hello world recovery test.\n" * 8).encode("utf-8")
 PLANT_ARABIC = ("علامة بحث عربية لاختبار الاسترجاع.\n" * 8).encode("utf-8")
@@ -213,7 +214,8 @@ class TestPinnedCalibration(unittest.TestCase):
         self.assertEqual(S.DEFAULT_MIN_RUN, 256)
 
     def test_version(self):
-        self.assertEqual(S.VERSION, "7.0.3")
+        self.assertEqual(S.VERSION, version.VERSION)
+        self.assertRegex(S.VERSION, r"^\d+\.\d+\.\d+$")
 
 
 class TestTextRunPrefilter(unittest.TestCase):

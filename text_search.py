@@ -72,7 +72,8 @@ from itertools import accumulate
 
 import text_ngram
 
-VERSION = "7.0.3"
+from version import VERSION as VERSION  # single source: version.py
+# Re-exported under the module's own name so `module.VERSION` keeps working.
 
 __all__ = [
     "VERSION",
