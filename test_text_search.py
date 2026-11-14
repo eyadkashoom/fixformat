@@ -178,5 +178,60 @@ class TestPinnedCalibration(unittest.TestCase):
         self.assertEqual(S.VERSION, "7.0.3")
 
 
+class TestTextRunPrefilter(unittest.TestCase):
+    """The prefilter is the performance contract: no run, no scoring.
+
+    It must find runs in every encoding the search supports and find none in
+    bytes that hold no text, otherwise the speed-up would be bought with recall.
+    """
+
+    def runs(self, data):
+        return S._text_runs(data)
+
+    def test_ascii_text_has_a_run(self):
+        run = self.runs(PLANT_ASCII * 4)
+        self.assertTrue(run, "no run found in ASCII text")
+        self.assertEqual(run[0][0], 0)
+
+    def test_arabic_utf8_has_a_run(self):
+        self.assertTrue(self.runs(PLANT_ARABIC * 4), "no run found in Arabic UTF-8")
+
+    def test_utf16le_has_a_run(self):
+        self.assertTrue(self.runs(PLANT_UTF16 * 4), "no run found in UTF-16LE")
+
+    def test_random_and_zeros_have_no_run(self):
+        rnd = bytes(random.Random(0xBAD).randrange(256) for _ in range(65536))
+        self.assertEqual(self.runs(rnd), [])
+        self.assertEqual(self.runs(b"\x00" * 65536), [])
+        self.assertEqual(self.runs(b"\xff" * 65536), [])
+
+    def test_zeros_scan_is_not_per_window(self):
+        # 1 MiB of zeros took ~3 minutes before the prefilter (15-length decode
+        # sweep per window). The bound is deliberately loose - it only has to
+        # fail if the prefilter stops short-circuiting.
+        import time
+        data = b"\x00" * (1024 * 1024)
+        t0 = time.perf_counter()
+        self.assertEqual(S.search(data), [])
+        self.assertLess(time.perf_counter() - t0, 10.0)
+
+    def test_ascii_run_scorer_matches_window_scorer(self):
+        # The prefix-sum scorer must equal the trigram score of the very same
+        # window text; score_window may be marginally higher because it also
+        # takes the max over the trim cuts, so it must never be lower.
+        import text_ngram as N
+        model = N.default_model()
+        data = PLANT_ASCII * 8
+        run = S._RunScorer(data, 0, len(data), "ascii", model)
+        for start in (0, 64, 256):
+            window = data[start:start + 512]
+            expected = N.trigram_logprob(model, window.decode("utf-8"))
+            got = run.score(start, start + len(window), S.MIN_REGION_BYTES)
+            self.assertIsNotNone(got)
+            self.assertAlmostEqual(float(got), float(expected), places=6)
+            best, _enc, _text = S.score_window(window)
+            self.assertGreaterEqual(float(best), float(got))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
