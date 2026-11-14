@@ -323,7 +323,11 @@ def _absorb(regions, cur, start, score, enc, nbytes, step):
         if start + nbytes > cur["end"]:
             cur["end"] = start + nbytes
         if score > cur["best"]:
-            cur.update(best=score, enc=enc, win=(start, nbytes))
+            # Score and preview position move to the best window, but `enc` does
+            # NOT: a region's encoding must describe the bytes at its own offset,
+            # otherwise a merged ASCII+UTF-16 region advertises one encoding and
+            # previews text from another.
+            cur.update(best=score, win=(start, nbytes))
         return cur
     if cur is not None:
         regions.append(cur)
@@ -485,15 +489,21 @@ def search(data, top_n=10, threshold=None, window=None, step=None,
 
 
 def _preview_text(data, enc, start, length):
-    """Decoded text of one window, for the `preview` field only."""
+    """Decoded text of one window, for the `preview` field only.
+
+    Decoded with the region's OWN codec and errors="replace". Falling back to
+    another codec is what produced the reported bug: a 512-byte slice of UTF-16LE
+    text whose tail was random bytes is not valid UTF-16LE, the decode raised, the
+    fallback read it as UTF-8 and the preview became "E\x00 \x00r\x00...". The
+    preview must never change the encoding the row claims.
+    """
     chunk = data[start:start + length]
-    candidates = (enc,) if enc == "utf-16le" else (enc, "utf-16-le")
-    for codec in candidates:
-        try:
-            return chunk.decode(codec)
-        except (UnicodeDecodeError, ValueError):
-            continue
-    return chunk.decode("utf-8", "replace")
+    codec = "utf-16-le" if enc == "utf-16le" else "utf-8"
+    text = chunk.decode(codec, "replace") if codec != "utf-8" \
+        else chunk.decode("utf-8", "replace")
+    # NUL is not text: cut the preview where the decoded window stops being language.
+    nul = text.find("\x00")
+    return text if nul < 0 else text[:nul]
 
 
 def min_chars_floor(min_run):

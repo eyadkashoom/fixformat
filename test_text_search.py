@@ -159,6 +159,44 @@ class TestContract(unittest.TestCase):
         self.assertEqual(S.search(build_image(), top_n=0), [])
 
 
+class TestMergedRegionEncoding(unittest.TestCase):
+    """A region must describe the bytes at its own offset.
+
+    Reported bug: a UTF-16LE region whose highest-scoring window ended in random
+    bytes came back with a preview decoded as UTF-8 ("E\x00 \x00r\x00..."),
+    because the preview fell back to another codec when the strict decode failed.
+    The row's encoding and its preview have to agree, always.
+    """
+
+    def image(self):
+        rnd = random.Random(0x5EED)
+        n = 512 * 1024
+        bg = bytearray(rnd.randbytes(n))
+        off = 200 * 1024 - (200 * 1024) % 64
+        bg[off:off + len(PLANT_UTF16)] = PLANT_UTF16
+        return bytes(bg), off
+
+    def test_preview_is_decodable_with_the_reported_encoding(self):
+        data, off = self.image()
+        hits = S.search(data, top_n=5)
+        utf16 = [h for h in hits if h["encoding"] == "utf-16le"]
+        self.assertTrue(utf16, "UTF-16LE plant not reported: %s" % hits)
+        hit = utf16[0]
+        self.assertNotIn("\x00", hit["preview"],
+                         "preview contains NULs: %r" % hit["preview"][:40])
+        self.assertIn("SEARCHMARK", hit["preview"])
+        self.assertLessEqual(hit["offset"], off)
+        self.assertLess(off, hit["offset"] + hit["length"])
+
+    def test_preview_text_never_switches_codec(self):
+        # A UTF-16LE slice whose tail is random must decode with its own codec,
+        # replaced where invalid, and never be reinterpreted as UTF-8.
+        text = S._preview_text(PLANT_UTF16 + b"\xff\xfe\xfd", "utf-16le", 0,
+                               len(PLANT_UTF16) + 3)
+        self.assertNotIn("\x00", text)
+        self.assertIn("SEARCHMARK", text)
+
+
 class TestPinnedCalibration(unittest.TestCase):
     """Thresholds are measured constants - a change must be deliberate."""
 

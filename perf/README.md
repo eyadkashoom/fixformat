@@ -47,6 +47,20 @@ regions (offset, length, encoding) than the baseline. Scores may differ by a few
 hundredths: the optimised path takes the full-window reading where the old one
 took the maximum over the 15 trim cuts.
 
+## Recall contract
+
+A planted text block counts as found when **a reported region covers it**
+(`offset <= plant < offset + length`), not when a region starts within a fixed
+distance of it. A 512-byte window that holds 384 bytes of the plant legitimately
+scores above threshold, so a region may begin up to one window before the plant;
+`offset` is the region start and `length` is how far it runs. The CI step runs
+`bench_text_search.py --sizes 5 --corpus mixed` and fails on any uncovered plant.
+
+A row's `encoding` always describes the bytes at its own `offset`, and its
+`preview` is decoded with that same encoding (`errors="replace"`, cut at the
+first NUL). A preview decoded with a different codec than the row advertises is a
+bug: it reported UTF-16LE regions as `utf-8` with `"E\x00 \x00r\x00..."` previews.
+
 ## Design notes (what made it fast)
 
 1. **Text-run prefilter** (`_text_runs`): one `bytes.translate` mask pass plus

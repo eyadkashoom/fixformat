@@ -78,12 +78,20 @@ def run_one(name, mib):
     dt = time.perf_counter() - t0
     peak = peak_rss_mib()
     mb = len(data) / 1048576.0
-    ok = len(hits) >= plants and (plants == 0 or all(
-        any(abs(h["offset"] - o) <= 64 for h in hits)
-        for o in _plant_offsets(name, len(data))))
+    # A plant counts as found when a reported region COVERS it. Requiring the
+    # region to start within +/-64 bytes of the plant was wrong: a window holding
+    # 384 of the plant's 512 bytes legitimately scores above threshold, so the
+    # region starts up to one window earlier. Coverage is the real contract, and
+    # a caller gets the exact offset from the region start plus its length.
+    def covered(off):
+        return any(h["offset"] <= off < h["offset"] + h["length"] for h in hits)
+
+    missing = [o for o in _plant_offsets(name, len(data)) if not covered(o)]
+    ok = len(hits) >= plants and not missing
     return {
         "corpus": name, "mib": mb, "sec": dt, "mibs": mb / dt if dt else 0.0,
         "peak_mib": peak - rss_before, "regions": len(hits), "ok": ok,
+        "missing": missing, "hits": hits,
     }
 
 
@@ -117,9 +125,12 @@ def main(argv):
         for name in names:
             r = run_one(name, mib)
             worst = 0 if r["ok"] else 1
+            state = "ok" if r["ok"] else "MISSING %s" % [
+                (o, [(h["offset"], h["length"]) for h in r["hits"]])
+                for o in r["missing"]]
             print("%-11s %6.0f MiB %8.3f %9.2f %8.1f MiB %8d %s" % (
                 r["corpus"], r["mib"], r["sec"], r["mibs"], r["peak_mib"],
-                r["regions"], "ok" if r["ok"] else "MISSING"))
+                r["regions"], state))
     return worst
 
 

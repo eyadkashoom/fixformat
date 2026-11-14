@@ -46,6 +46,11 @@ jobs:
         # Performance gate: fails if throughput drops below the published
         # target or if the scan stops scaling linearly (perf/README.md).
         python test_text_search_perf.py
+        # Plant recall at a size where region merging is active: a reported
+        # region must cover each planted text block, and the benchmark exits
+        # non-zero otherwise.
+        python perf/bench_text_search.py --sizes 5 --corpus mixed
+        python perf/bench_text_search.py --sizes 5 --corpus noise
         python test_text_recovery_pipeline.py
 
     # Release safeguards (v7.0.2 rules). These run on every push/PR, so a tag
