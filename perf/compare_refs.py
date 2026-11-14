@@ -87,7 +87,8 @@ def main(argv):
 
     old, sha = load_baseline(baseline)
     print("baseline : %s (text_search.py %s)" % (baseline, sha))
-    print("candidate: working tree, text_search.py %s\\n" % NEW.VERSION)
+    print("candidate: working tree, text_search.py %s" % NEW.VERSION)
+    print()
     print("%-18s %10s %10s %8s   %s"
           % ("corpus", "base MiB/s", "new MiB/s", "speedup", "regions"))
     print("-" * 72)

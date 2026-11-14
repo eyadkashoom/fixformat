@@ -68,6 +68,11 @@ CORPORA = ("noise", "zeros", "compressed", "mixed", "ascii", "arabic", "utf16le"
 
 def run_one(name, mib):
     data, plants = corpus(name, mib)
+    # Peak working set BEFORE the scan: building a 100 MiB corpus by repeating a
+    # slice leaves its own high-water mark, which has nothing to do with the
+    # scanner. Reporting the delta is what answers "does the search grow with
+    # input size".
+    rss_before = peak_rss_mib()
     t0 = time.perf_counter()
     hits = S.search(data, top_n=10)
     dt = time.perf_counter() - t0
@@ -78,7 +83,7 @@ def run_one(name, mib):
         for o in _plant_offsets(name, len(data))))
     return {
         "corpus": name, "mib": mb, "sec": dt, "mibs": mb / dt if dt else 0.0,
-        "peak_mib": peak, "regions": len(hits), "ok": ok,
+        "peak_mib": peak - rss_before, "regions": len(hits), "ok": ok,
     }
 
 
@@ -105,7 +110,7 @@ def main(argv):
         names = (argv[argv.index("--corpus") + 1],)
 
     print("%-11s %8s %9s %9s %10s %8s %s" % (
-        "corpus", "size", "seconds", "MiB/s", "peak RSS", "regions", "plants"))
+        "corpus", "size", "seconds", "MiB/s", "scan RSS", "regions", "plants"))
     print("-" * 74)
     worst = 0
     for mib in sizes:
