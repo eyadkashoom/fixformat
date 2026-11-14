@@ -27,6 +27,23 @@ remaining speed-up is obtained by scoring each character once instead of
 text. Beating the per-character cost would need a C extension, which is out of
 scope for a stdlib-only tool.
 
+## Measured steady state
+
+Throughput at sufficient size (development host, no competing load). Small inputs
+look faster because the whole scan stays in cache; the tail is the honest number:
+
+| corpus | 1–4 MiB | 5–20 MiB | 36–200 MiB |
+|---|---|---|---|
+| arabic UTF-8 | 0.93 | 0.54–0.65 | 0.50 |
+| ascii | 0.83 | 0.56–0.71 | 0.57 |
+| utf-16le | 1.27 | 1.00 | 0.99–1.06 |
+| noise / zeros / compressed | — | 17–33 | 24–33 |
+
+Arabic and ASCII plateau at 0.5–0.7 MiB/s, UTF-16LE at ~1.0 MiB/s: the cost is the
+trigram model per character, not the input size, and peak RSS at these sizes is
+already set by the corpus itself (scan adds 0.0 MiB). A number below 1 MiB is
+therefore a cache effect, not a leak.
+
 ## How to reproduce
 
 ```bash
