@@ -309,7 +309,7 @@ def score_window(window, model=None, min_chars=MIN_REGION_BYTES, stop_at=None):
     return best
 
 
-def _absorb(regions, cur, start, score, enc, wend, step):
+def _absorb(regions, cur, start, score, enc, nbytes, step):
     """Add one above-threshold window to the region being built.
 
     Same rule as `_merge_regions` - windows within one step join the current
@@ -319,7 +319,6 @@ def _absorb(regions, cur, start, score, enc, wend, step):
     `offset` must be where the region begins, or a caller matching a known offset
     would be placed hundreds of bytes late.
     """
-    nbytes = wend - start
     if cur is not None and start <= cur["end"] + step:
         if start + nbytes > cur["end"]:
             cur["end"] = start + nbytes
@@ -449,7 +448,8 @@ def search(data, top_n=10, threshold=None, window=None, step=None,
                     # 'ascii' is an internal fast-path label; the public encoding
                     # of plain ASCII text is 'utf-8' (it is a valid UTF-8 stream).
                     enc = "utf-8" if scorer.mode == "ascii" else scorer.mode
-                    cur = _absorb(regions, cur, start, score, enc, wend, step)
+                    cur = _absorb(regions, cur, start, score, enc,
+                                  wend - start, step)
                 continue
         score, enc, text = score_window(data[start:wend], model,
                                         stop_at=threshold)
@@ -458,7 +458,9 @@ def search(data, top_n=10, threshold=None, window=None, step=None,
         # Byte length, not character length: a UTF-16LE region is half as many
         # characters as bytes, so measuring characters would make a real 560-byte
         # plant look like 280 and drop it below a 256-byte minimum.
-        cur = _absorb(regions, cur, start, score, enc, wend, step)
+        # len(...), not wend - start: the last window is truncated at EOF and a
+        # region must not claim bytes past the end of the buffer.
+        cur = _absorb(regions, cur, start, score, enc, len(data[start:wend]), step)
 
     if cur is not None:
         regions.append(cur)

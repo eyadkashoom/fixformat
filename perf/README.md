@@ -60,7 +60,8 @@ took the maximum over the 15 trim cuts.
    a byte//2 map for UTF-16LE, so all three encodings take the same path.
 4. **Bounded memory**: prefix arrays are built per 1 MiB chunk and the previous
    chunk is dropped as the scan advances. Peak RSS does not grow with input size.
-   Measured 1 MiB → 10 MiB of ASCII text: 42.6 MiB → 108.1 MiB peak working set,
-   which is the chunk arrays plus the corpora the harness itself holds; it is a
-   high-water mark, not a per-byte cost, so a 100 MiB text scan sits at the same
-   ~110 MiB (see `perf/bench_text_search.py --sizes 100 --corpus ascii`).
+   Measured 1 MiB → 10 MiB of ASCII text: 44.2 MiB → 67.2 MiB peak working set
+   (23 MiB of growth for 9 MiB more text), and at 100–200 MiB the scan adds
+   nothing to the peak already set by the input itself (`scan RSS 0.0 MiB` in
+   `perf/bench_text_search.py --sizes 100`). Regions are merged as the scan
+   advances, so the pending-region list is O(regions), not O(windows).
