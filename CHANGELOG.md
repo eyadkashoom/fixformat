@@ -19,6 +19,15 @@ plus a hard recall fix driven by a committed **golden fixture set**
 - `test_fixtures.py` — 13 assertions: reproducibility, precision (every
   negative fixture stays silent) and recall (every positive is found with the
   coverage and codec its manifest entry declares).
+- `search_stream(fileobj, chunk=8 MiB)` — bounded-memory scan: reads blocks with
+  `window + step` of carry-over, needs only `read(n)` (no seek), and merges the
+  per-block rows into the same regions an in-memory pass reports.
+  `search_file()` now streams instead of reading the whole file, so a 476 GiB
+  image can be scanned at all: measured on a 256 MiB image, 15.6 MiB/s with
+  59 MiB of RSS growth and 33 read calls, largest 8 MiB, and byte-identical
+  regions (offset, encoding, length) to `search()` on the same file.
+  `test_text_search_stream.py` — 10 assertions, including a text block placed
+  across a forced block boundary and a reader that refuses to seek.
 - `python-app.yml` now runs `generate_fixtures.py --check` and
   `test_fixtures.py`, so the fixture set is the source of truth for
   text-recovery claims rather than an assertion in a report.
@@ -48,6 +57,12 @@ plus a hard recall fix driven by a committed **golden fixture set**
   their own codec.
 - `test_text_search_perf.py` opened `text_search.py` without closing the handle
   (a `ResourceWarning`); the file is now read inside a `with` block.
+- **Two preview defects found while exercising the stream.** The NUL guard was
+  written as `text.find("\\x00")` — a literal backslash sequence, not a NUL — so
+  it never matched and a preview ran into the padding after the text. And a
+  region starting one byte into a multi-byte character left a leading U+FFFD in
+  the preview. The guard now matches a real NUL, and leading replacement
+  characters are dropped (damage inside the text is still shown).
 
 ### Performance
 - NUL-rich input without text: 20.3 → 14.9 MiB/s on the 10 MiB mixed corpus

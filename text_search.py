@@ -78,7 +78,8 @@ __all__ = [
     "VERSION",
     "DEFAULT_THRESHOLD", "DEFAULT_WINDOW", "DEFAULT_STEP", "DEFAULT_MIN_RUN",
     "MIN_REGION_BYTES", "PREVIEW_CHARS",
-    "score_window", "search", "search_file", "main",
+    "DEFAULT_CHUNK", "score_window", "search", "search_stream", "search_file",
+    "main",
 ]
 
 # --- calibrated defaults ----------------------------------------------------
@@ -547,7 +548,13 @@ def _preview_text(data, enc, start, length):
         else chunk.decode("utf-8", "replace")
     # NUL is not text: cut the preview where the decoded window stops being language.
     nul = text.find("\x00")
-    return text if nul < 0 else text[:nul]
+    if nul >= 0:
+        text = text[:nul]
+    # A region can start one byte into a multi-byte character (the window grid
+    # steps by 64 bytes, the text does not). errors="replace" then puts U+FFFD at
+    # the front: honest for a decoder, noise for a reader. Drop the leading
+    # replacement characters only, so damage inside the text stays visible.
+    return text.lstrip("\ufffd")
 
 
 def min_chars_floor(min_run):
@@ -707,14 +714,98 @@ def _make_scorer(data, start, end, model):
         return None
 
 
-def search_file(path, top_n=10, **kwargs):
-    """Search a file read-only. Returns the same shape as search()."""
+DEFAULT_CHUNK = 8 << 20     # bytes read per iteration by search_stream; the only
+                           # thing that sets its peak memory.
+
+
+def _merge_stream_hits(hits, step):
+    """Union per-block rows into the regions one in-memory pass would report.
+
+    Every block is scanned with `window + step` bytes of carry-over, so a region
+    that straddles a block edge is seen twice: once cut short, once whole. Merge
+    is required for two reasons - to report one row instead of two, and to
+    extend a region that the first block could only see partially. Encoding is
+    part of the identity of a region (a row's `encoding` must describe all of
+    its bytes), so only same-codec rows merge.
+    """
+    if not hits:
+        return []
+    hits.sort(key=lambda h: (h["offset"], h["length"]))
+    out = []
+    for hit in hits:
+        if out:
+            cur = out[-1]
+            cur_end = cur["offset"] + cur["length"]
+            hit_end = hit["offset"] + hit["length"]
+            if cur["encoding"] == hit["encoding"] \
+                    and hit["offset"] <= cur_end + step:
+                cur["length"] = max(cur_end, hit_end) - cur["offset"]
+                if hit["score"] > cur["score"]:
+                    # Preview and score come from the same winning window.
+                    cur["score"] = hit["score"]
+                    cur["preview"] = hit["preview"]
+                continue
+        out.append(dict(hit))
+    return out
+
+
+def search_stream(fileobj, chunk=DEFAULT_CHUNK, top_n=10, threshold=None,
+                  window=None, step=None, min_run=None, model=None):
+    """Like `search()`, but reads a stream in bounded blocks instead of bytes.
+
+    `search(data)` needs the whole buffer in memory, which rules out a disk
+    image of hundreds of gigabytes. This reads `chunk` bytes at a time and keeps
+    the last `window + step` bytes as carry-over, so a region is never cut at a
+    block edge. Peak memory is O(chunk), independent of the input size.
+
+    `fileobj` only has to provide `read(n)`; seeking is not required and never
+    performed, so a pipe or a device object works. Returns the same row shape as
+    `search()`, with `length` re-measured after merging in caller coordinates.
+    """
+    window = DEFAULT_WINDOW if window is None else int(window)
+    step = DEFAULT_STEP if step is None else int(step)
+    chunk = max(int(chunk), window + step)
+    overlap = window + step
+    model = text_ngram.default_model() if model is None else model
+    hits = []
+    carry = b""
+    pos = 0                     # absolute offset of the next unread byte
+    while True:
+        block = b""
+        while len(block) < chunk:
+            piece = fileobj.read(chunk - len(block))
+            if not piece:
+                break
+            block += piece
+        if not block:
+            break
+        buf = carry + block
+        buf_base = pos - len(carry)
+        # top_n is per block here: every block must contribute all of its rows so
+        # the merge can see them; the caller's top_n is applied after merging.
+        for hit in search(buf, top_n=max(1, len(buf)), threshold=threshold,
+                          window=window, step=step, min_run=min_run,
+                          model=model):
+            hit["offset"] += buf_base
+            hits.append(hit)
+        pos += len(block)
+        carry = buf[-overlap:]
+    merged = _merge_stream_hits(hits, step)
+    merged.sort(key=lambda h: (-h["score"], h["offset"]))
+    return merged[:max(0, int(top_n))]
+
+
+def search_file(path, top_n=10, chunk=DEFAULT_CHUNK, **kwargs):
+    """Search a file read-only, streaming it. Returns the same shape as search().
+
+    This used to read the whole file into memory (`fh.read()`), which made a
+    476 GiB image impossible to scan at all: the read alone exceeded system RAM.
+    """
     try:
         with open(path, "rb") as fh:
-            data = fh.read()
+            return search_stream(fh, chunk=chunk, top_n=top_n, **kwargs)
     except OSError:
         return []
-    return search(data, top_n=top_n, **kwargs)
 
 
 def main(argv=None):
