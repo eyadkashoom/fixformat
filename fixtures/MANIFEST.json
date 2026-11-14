@@ -1,0 +1,198 @@
+{
+  "generator_version": 1,
+  "seed": 24301,
+  "max_bytes": 65536,
+  "fixtures": [
+    {
+      "path": "negative/random_noise.bin",
+      "kind": "negative",
+      "expected": "non-text",
+      "bytes": 10240,
+      "sha256": "8696052c7ef6cde2f4943843dcfd15876af1f8a02c07c91c0732ea543119be21",
+      "note": "10 KiB of seeded random bytes; the baseline false-positive probe",
+      "acceptance": {
+        "min_regions": 0,
+        "max_regions": 0
+      }
+    },
+    {
+      "path": "negative/zeros.bin",
+      "kind": "negative",
+      "expected": "non-text",
+      "bytes": 10240,
+      "sha256": "84ff92691f909a05b224e1c56abb4864f01b4f8e3c854e4bb4c7baf1d3f6d652",
+      "note": "10 KiB of NUL: lowest possible entropy, must never be reported as text",
+      "acceptance": {
+        "min_regions": 0,
+        "max_regions": 0
+      }
+    },
+    {
+      "path": "negative/compressed.bin",
+      "kind": "negative",
+      "expected": "non-text",
+      "bytes": 32796,
+      "sha256": "94f85ace36b43bdc90168b70282ebbc8a537307b0bacf68f8af35f6bba393b2c",
+      "note": "gzip stream; high entropy and a binary header",
+      "acceptance": {
+        "min_regions": 0,
+        "max_regions": 0
+      }
+    },
+    {
+      "path": "negative/binary_structures.bin",
+      "kind": "negative",
+      "expected": "non-text",
+      "bytes": 4423,
+      "sha256": "ee1b5b2a9df3fac1e0ef853c5931de172755673977d537f7135a73477bb857fd",
+      "note": "ELF/PNG/JPEG/PE/ZIP/gzip headers with random filler between them",
+      "acceptance": {
+        "min_regions": 0,
+        "max_regions": 0
+      }
+    },
+    {
+      "path": "positive/ascii_plain.txt",
+      "kind": "positive",
+      "expected": "text",
+      "bytes": 4128,
+      "sha256": "1a61ecbf7dd86bacc2b7374edaa4379c9b6cb298dad87b108f07afc2c1228e3c",
+      "note": "English prose, ASCII",
+      "acceptance": {
+        "min_regions": 1,
+        "min_coverage": 0.95,
+        "encodings": [
+          "utf-8"
+        ]
+      }
+    },
+    {
+      "path": "positive/utf8_arabic.txt",
+      "kind": "positive",
+      "expected": "text",
+      "bytes": 5952,
+      "sha256": "4515f94925495a12a7fcbc2056e80be693e4858cab01f0519fa06d1bae8c9bd0",
+      "note": "Arabic prose, UTF-8",
+      "acceptance": {
+        "min_regions": 1,
+        "min_coverage": 0.95,
+        "encodings": [
+          "utf-8"
+        ]
+      }
+    },
+    {
+      "path": "positive/utf16le_english.txt",
+      "kind": "positive",
+      "expected": "text",
+      "bytes": 8256,
+      "sha256": "1d55693117461164d638c24e08f83970b66e05a550e6905098cde77f1f6632c1",
+      "note": "English prose, UTF-16LE (no BOM)",
+      "acceptance": {
+        "min_regions": 1,
+        "min_coverage": 0.95,
+        "encodings": [
+          "utf-16le"
+        ]
+      }
+    },
+    {
+      "path": "positive/utf16le_arabic.txt",
+      "kind": "positive",
+      "expected": "text",
+      "bytes": 6540,
+      "sha256": "264fb63549d7faaf4696df9d1fe5a6dc1b056c81ae616092b5de6accbf2ab804",
+      "note": "Arabic prose, UTF-16LE (no BOM)",
+      "acceptance": {
+        "min_regions": 1,
+        "min_coverage": 0.95,
+        "encodings": [
+          "utf-16le"
+        ]
+      }
+    },
+    {
+      "path": "positive/utf16be_english.txt",
+      "kind": "positive",
+      "expected": "text",
+      "bytes": 8256,
+      "sha256": "92f6b51d38bfb29bfdef180d1916f3cc71679add5ca1d27e09544602a3f25015",
+      "note": "English prose, UTF-16BE — declared positive, currently a KNOWN GAP: text_classify/text_ngram/text_search have no UTF-16BE path",
+      "acceptance": {
+        "min_regions": 1,
+        "min_coverage": 0.95,
+        "encodings": [
+          "utf-16le"
+        ],
+        "why": "UTF-16BE is recovered through the odd-parity UTF-16LE reading, so the row is byte-accurate as utf-16le; there is no utf-16be code path in the text layers"
+      }
+    },
+    {
+      "path": "positive/mixed_encodings.bin",
+      "kind": "positive",
+      "expected": "text",
+      "bytes": 5396,
+      "sha256": "8e1d952956ebf9b101adf4ca295be580ed0da75fdeda7d4445815948ae9ecbaa",
+      "note": "ASCII / UTF-8 Arabic / UTF-16LE runs with binary gaps between them",
+      "acceptance": {
+        "min_regions": 2,
+        "min_coverage": 0.9,
+        "encodings": [
+          "utf-8",
+          "utf-16le"
+        ]
+      }
+    },
+    {
+      "path": "edge_cases/bom_variants.bin",
+      "kind": "edge-case",
+      "expected": "text",
+      "bytes": 4007,
+      "sha256": "67f46ec5000e3eb228649cfbf56a7a814e24b1e93b0f577da6c1436879c08462",
+      "note": "UTF-8 BOM, UTF-16LE BOM and UTF-16BE BOM runs in one buffer",
+      "acceptance": {
+        "min_regions": 2,
+        "min_coverage": 0.7
+      }
+    },
+    {
+      "path": "edge_cases/truncated_runs.bin",
+      "kind": "edge-case",
+      "expected": "text",
+      "bytes": 2468,
+      "sha256": "8cad0740147dbdea836f565cf5f7a5674ccddfd06457c780b66b908f60194368",
+      "note": "runs cut mid-character: decoding must use errors=replace, never raise",
+      "acceptance": {
+        "min_regions": 2,
+        "min_coverage": 0.6
+      }
+    },
+    {
+      "path": "edge_cases/misaligned_utf16le.bin",
+      "kind": "edge-case",
+      "expected": "text",
+      "bytes": 2003,
+      "sha256": "c5fc389a2c4c381c7b77dcb31922c113cb0e2776ae07588628dc7401b46afd5d",
+      "note": "UTF-16LE text starting at an odd byte offset: code-unit parity is a property of the run, not of the buffer start",
+      "acceptance": {
+        "min_regions": 1,
+        "min_coverage": 0.9,
+        "encodings": [
+          "utf-16le"
+        ]
+      }
+    },
+    {
+      "path": "edge_cases/sparse_text.bin",
+      "kind": "edge-case",
+      "expected": "text",
+      "bytes": 30478,
+      "sha256": "0f9b016a74eb2c9398caab252f3f0dfd027230de7fcc57f41f21a8e22069ae37",
+      "note": "300-byte text islands separated by 4 KiB zero gaps",
+      "acceptance": {
+        "min_regions": 6,
+        "min_coverage": 0.15
+      }
+    }
+  ]
+}
