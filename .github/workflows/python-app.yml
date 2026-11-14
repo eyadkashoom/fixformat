@@ -43,6 +43,9 @@ jobs:
         python test_text_classify.py
         python test_text_ngram.py
         python test_text_search.py
+        # Bounded-memory scan: streaming must cover everything the in-memory
+        # pass covers, and a region must never be cut at a block edge.
+        python test_text_search_stream.py
         # Golden fixtures (backlog item: reproducible reference data). The check
         # proves the committed bytes are exactly what scripts/generate_fixtures.py
         # produces from its fixed seed; the test then proves every negative

@@ -270,6 +270,40 @@ class TestTextRunPrefilter(unittest.TestCase):
             best, _enc, _text = S.score_window(window)
             self.assertGreaterEqual(float(best), float(got))
 
+class TestPreviewHygiene(unittest.TestCase):
+    """What the user reads must be the region's text, not decoder scaffolding."""
+
+    def test_preview_stops_at_the_first_nul(self):
+        # The guard was written as text.find("\\x00") - a literal backslash
+        # sequence - so it never matched a real NUL and previews ran into the
+        # padding after the text.
+        data = b"hello world" + b"\x00" * 8 + b"garbage"
+        got = S._preview_text(data, "utf-8", 0, len(data))
+        self.assertEqual(got, "hello world")
+
+    def test_preview_drops_leading_replacement_characters(self):
+        # A window can start one byte into a multi-byte character; the decode is
+        # then honest but the leading U+FFFD is noise for a reader.
+        data = b"\xe2\x82" + "عربي".encode("utf-8") + b"\x00\x00rest"
+        got = S._preview_text(data, "utf-8", 0, len(data))
+        self.assertTrue(got.startswith("عربي"), got)
+        self.assertNotIn("\ufffd", got)
+
+    def test_preview_keeps_damage_inside_the_text(self):
+        # Only leading replacements are dropped: real damage must stay visible.
+        data = "نص".encode("utf-8") + b"\xff" + "سليم".encode("utf-8") + b"\x00"
+        got = S._preview_text(data, "utf-8", 0, len(data))
+        self.assertIn("\ufffd", got)
+
+    def test_preview_of_a_real_region_has_no_nul(self):
+        data = (b"\x00" * 600
+                + b"The quick brown fox jumps over the lazy dog. " * 40
+                + b"\x00" * 600)
+        hits = S.search(data)
+        self.assertTrue(hits)
+        for hit in hits:
+            self.assertNotIn("\x00", hit["preview"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
