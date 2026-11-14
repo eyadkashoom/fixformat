@@ -2,6 +2,73 @@
 
 All notable changes to **fixformat** will be documented in this file.
 
+## [Unreleased] — text_search recall & golden fixtures
+
+Performance rewrite of `text_search.py` (prefix-sum trigram scoring over all
+three encodings, 4 MiB sliced prefilter, region-merge as the scan advances)
+plus a hard recall fix driven by a committed **golden fixture set**
+(`fixtures/` + `MANIFEST.json`).
+
+### Added
+- `fixtures/` — 14 reference files (4 negative, 6 positive, 4 edge-case,
+  135 KB total). Every file has a `MANIFEST.json` entry with size, SHA-256,
+  expected verdict, and acceptance criteria (`min_regions`, `min_coverage`,
+  `encodings`). `scripts/generate_fixtures.py` is deterministic (seed `24301`);
+  `--check` verifies a byte-for-byte match, and `.gitattributes` keeps Git from
+  rewriting the line endings of the text fixtures.
+- `test_fixtures.py` — 13 assertions: reproducibility, precision (every
+  negative fixture stays silent) and recall (every positive is found with the
+  coverage and codec its manifest entry declares).
+- `python-app.yml` now runs `generate_fixtures.py --check` and
+  `test_fixtures.py`, so the fixture set is the source of truth for
+  text-recovery claims rather than an assertion in a report.
+
+### Fixed
+- **Arabic UTF-16LE regression introduced by the performance rewrite — not a
+  pre-existing blind spot in `main`.** On `main` (pre-optimization) Arabic
+  UTF-16LE was fully detected (6540/6540 bytes at offset 0x0). The prefix-sum
+  scorer added in the rewrite routed the high byte `0x06` (common in
+  U+0600–U+06FF, and a legal ASCII control code point) through the UTF-8 fast
+  path, scored the slice at the trigram floor (-4.47) and dropped it: detection
+  fell to 460/6540 bytes. `_pick_encoding` now rejects a UTF-8 reading whose
+  bytes are more than 5% C0 controls and falls through to the UTF-16LE reading,
+  restoring 6540/6540 bytes. The defect belongs to the optimized code, and the
+  regression window is the rewrite, not `main`.
+- **UTF-16LE at an odd byte offset was invisible.** The prefilter masked a
+  single code-unit parity against the buffer start, so a run beginning on an
+  odd byte was silently missed. A second-parity mask now treats parity as a
+  property of the run, not of the buffer (`edge_cases/misaligned_utf16le.bin`:
+  0 regions before, 1 region at 0x41 after).
+- **Preview decoded at the wrong parity.** For an odd-aligned region the
+  preview decoded from an even offset and printed CJK-range garbage for valid
+  text. The region start now snaps to the scorer's code-unit boundary.
+- **One region could merge two encodings.** ASCII prose followed by UTF-16LE was
+  reported as a single `utf-8` row whose second half is not UTF-8. A codec
+  change in `_absorb()` now ends the region, so both halves are reported with
+  their own codec.
+- `test_text_search_perf.py` opened `text_search.py` without closing the handle
+  (a `ResourceWarning`); the file is now read inside a `with` block.
+
+### Performance
+- NUL-rich input without text: 20.3 → 14.9 MiB/s on the 10 MiB mixed corpus
+  (still above the 10 MiB/s acceptance target; the cost and how to reclaim it
+  are recorded in `perf/README.md`).
+- Independent 10 MiB run at `08f335c`: zeros 21.0, noise 13.6, compressed 13.6,
+  ASCII 0.64, Arabic UTF-8 0.57, UTF-16LE English 1.02 MiB/s; peak RSS < 90 MB;
+  scaling 10.2× for 10× input. All targets met. A second run on the same code on
+  the development host measured Arabic 0.50 MiB/s, so Arabic sits at the 0.5
+  target rather than above it: the cost is the per-character pure-Python trigram
+  model (see `perf/README.md`), not the scan.
+
+### Notes
+- Green at `08f335c`: `test_fixtures.py` 13/13, `test_text_search.py` 30/30,
+  `test_text_search_perf.py` 8/8.
+- There is no `utf-16be` code path in the text layers. UTF-16BE text is
+  recovered through the odd-parity UTF-16LE reading, which is byte-accurate;
+  `fixtures/MANIFEST.json` records that in the `why` field of the entry.
+- `text_ngram` remains a binary accept/reject filter, not the perplexity
+  *ranking* the guide describes. Ranking stays open.
+
 ## [v7.0.3] - 2026-11-13
 
 Search, not just a gate. `text_search.py` ranks *where* language lives inside a

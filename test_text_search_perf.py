@@ -63,7 +63,8 @@ def make(kind, mib):
         blob = zlib.compress(b"A" * 4096)
         return (blob * (n // len(blob) + 1))[:n]
     if kind == "ascii":
-        src = open(os.path.join(HERE, "text_search.py"), "rb").read()
+        with open(os.path.join(HERE, "text_search.py"), "rb") as fh:
+            src = fh.read()
         return (src * (n // len(src) + 1))[:n]
     if kind == "arabic":
         unit = "قراءة النص العربي لاختبار البحث عن اللغة. "
