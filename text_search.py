@@ -137,6 +137,8 @@ _WS_DELETE = {ord(c): None for c in "\t\n\x0b\x0c\r \x1c\x1d\x1e\x1f\x85\xa0"}
 # above anything random bytes produce.
 _MIN_RUN_BYTES = 128
 _RUN_GAP = 64               # runs closer than this are treated as one
+_SCAN_CHUNK = 4 << 20       # prefilter slice: bounds mask memory to ~8x this, not
+                            # to 8x the input (100 MiB in one pass peaked at 840 MiB)
 
 
 def _mask_or(*masks):
@@ -204,11 +206,30 @@ def _text_runs(data):
     Conservative on purpose: a window overlapping ANY range is scored exactly as
     before, so the prefilter can only cost a little precision at region edges,
     never the language inside a run.
+
+    The mask pass runs over 4 MiB slices rather than the whole buffer. The masks
+    are big-int byte arrays (about 8 bytes of transient memory per input byte), so
+    scanning 100 MiB in one pass peaked at 840 MiB RSS. Slices carry a
+    _MIN_RUN_BYTES overlap: any run of that length either lies inside one slice or
+    fully inside the next one, and the overlapping detections merge.
     """
-    if len(data) < _MIN_RUN_BYTES:
+    n = len(data)
+    if n < _MIN_RUN_BYTES:
         return []
-    ranges = _runs_from_mask(_byte_mask(data), _MIN_RUN_BYTES)
-    ranges += _runs_from_mask(_utf16_mask(data), _MIN_RUN_BYTES // 2, scale=2)
+    ranges = []
+    pos = 0
+    while pos < n:
+        end = min(pos + _SCAN_CHUNK, n)
+        slice_end = min(end + _MIN_RUN_BYTES, n)
+        seg = data[pos:slice_end]
+        ranges += [(pos + a, pos + b)
+                   for a, b in _runs_from_mask(_byte_mask(seg), _MIN_RUN_BYTES)]
+        ranges += [(pos + a, pos + b)
+                   for a, b in _runs_from_mask(_utf16_mask(seg),
+                                               _MIN_RUN_BYTES // 2, scale=2)]
+        if slice_end >= n:
+            break
+        pos = end
     if not ranges:
         return []
     ranges.sort()
