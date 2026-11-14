@@ -43,6 +43,13 @@ jobs:
         python test_text_classify.py
         python test_text_ngram.py
         python test_text_search.py
+        # Golden fixtures (backlog item: reproducible reference data). The check
+        # proves the committed bytes are exactly what scripts/generate_fixtures.py
+        # produces from its fixed seed; the test then proves every negative
+        # fixture stays silent and every positive one is found, at the coverage
+        # and encoding recorded in fixtures/MANIFEST.json.
+        python scripts/generate_fixtures.py --check
+        python test_fixtures.py
         # Performance gate: fails if throughput drops below the published
         # target or if the scan stops scaling linearly (perf/README.md).
         python test_text_search_perf.py

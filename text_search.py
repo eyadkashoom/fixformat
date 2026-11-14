@@ -129,6 +129,16 @@ _WS_BYTES = b"\t\n\x0b\x0c\r "
 _TBL_NONWS = bytes(0 if i in b"\t\n\x0b\x0c\r " else 1 for i in range(256))
 _TBL_CONT_START = bytes(0 if 0x80 <= i <= 0xBF else 1 for i in range(256))
 _HINON_BYTES = bytes(sorted(_HI_NONNUL_SET | {0x00}))
+# Bytes that stand for a C0 control character in a UTF-8 stream (tab, LF, VT, FF
+# and CR are legal inside text; the rest are not), plus DEL. A chunk that
+# "decodes" as UTF-8 while being mostly control bytes is NOT text: that is
+# exactly what Arabic/Cyrillic UTF-16LE looks like, because U+0600-U+06FF puts
+# 0x06 in every high byte, and 0x06 is a legal ASCII control code point. Without
+# this check the UTF-8 reading won by default, the whole run was scored at the
+# trigram floor (-4.47) and never reported - a silent recall loss that the
+# NUL-rich English UTF-16LE corpora could not expose.
+_CTL_BYTES = bytes([b for b in range(0x20) if b not in b"\t\n\x0b\x0c\r"]) + b"\x7f"
+_CTL_MAX = 0.05
 _WS_DELETE = {ord(c): None for c in "\t\n\x0b\x0c\r \x1c\x1d\x1e\x1f\x85\xa0"}
 
 # Consecutive "text-shaped" bytes needed before a range is worth scoring. A
@@ -227,6 +237,16 @@ def _text_runs(data):
         ranges += [(pos + a, pos + b)
                    for a, b in _runs_from_mask(_utf16_mask(seg),
                                                _MIN_RUN_BYTES // 2, scale=2)]
+        # Second parity: a UTF-16LE run can start on an odd byte offset, because
+        # on a disk image text begins wherever the previous record ended. Masking
+        # only the buffer-aligned reading loses every odd-aligned run silently -
+        # the fixture edge_cases/misaligned_utf16le.bin exists to catch that. The
+        # extra pass is one C-level translate over the slice, i.e. mask cost, not
+        # scoring cost.
+        if len(seg) > 1:
+            ranges += [(pos + 1 + a, pos + 1 + b)
+                       for a, b in _runs_from_mask(_utf16_mask(seg[1:]),
+                                                   _MIN_RUN_BYTES // 2, scale=2)]
         if slice_end >= n:
             break
         pos = end
@@ -320,6 +340,14 @@ def _absorb(regions, cur, start, score, enc, nbytes, step):
     would be placed hundreds of bytes late.
     """
     if cur is not None and start <= cur["end"] + step:
+        if enc != cur["enc"]:
+            # A region's `encoding` must describe every byte it claims, so a
+            # change of codec ends the region instead of being absorbed into it.
+            # Without this, ASCII prose followed by UTF-16LE text was reported as
+            # one 5 KiB "utf-8" region whose second half is not UTF-8 at all.
+            regions.append(cur)
+            return dict(start=start, best=score, enc=enc, win=(start, nbytes),
+                        end=start + nbytes)
         if start + nbytes > cur["end"]:
             cur["end"] = start + nbytes
         if score > cur["best"]:
@@ -452,9 +480,25 @@ def search(data, top_n=10, threshold=None, window=None, step=None,
                     # 'ascii' is an internal fast-path label; the public encoding
                     # of plain ASCII text is 'utf-8' (it is a valid UTF-8 stream).
                     enc = "utf-8" if scorer.mode == "ascii" else scorer.mode
-                    cur = _absorb(regions, cur, start, score, enc,
-                                  wend - start, step)
-                continue
+                    astart = start
+                    if scorer.mode == "utf-16le" and (start - scorer.start) % 2:
+                        # The scorer decodes code units from its own chunk start,
+                        # so a window that begins one byte past that boundary
+                        # starts on a unit tail. Reporting `start` would make the
+                        # preview decode from the wrong parity and print CJK
+                        # garbage for perfectly good text (the odd-aligned
+                        # UTF-16LE fixture exists to catch exactly this).
+                        astart = start + 1
+                    cur = _absorb(regions, cur, astart, score, enc,
+                                  wend - astart, step)
+                    continue
+                # This chunk's locked encoding does not explain this window, so
+                # fall through instead of skipping it. A run that changes encoding
+                # partway (ASCII prose then UTF-16LE, or Arabic UTF-8 inside a
+                # NUL-padded block) is normal on a disk image, and one mode per
+                # 1 MiB chunk cannot represent it. The two-reading path below
+                # costs more per window, but it only runs where the fast path
+                # already proved the window is unexplained.
         score, enc, text = score_window(data[start:wend], model,
                                         stop_at=threshold)
         if score is None or score < threshold:
@@ -523,13 +567,28 @@ def _hi_nonnul_ratio(raw):
     return (len(hi) - len(hi.translate(None, _HINON_BYTES))) / len(hi)
 
 
+def _ctl_frac(raw):
+    """Fraction of bytes that are C0/DEL controls in a UTF-8 reading of `raw`.
+
+    Multi-byte UTF-8 sequences never contain bytes below 0x80, so counting the
+    raw bytes counts decoded control CHARACTERS exactly - one C-level translate
+    instead of a Python loop over a megabyte of text.
+    """
+    if not raw:
+        return 1.0
+    return (len(raw) - len(raw.translate(None, _CTL_BYTES))) / len(raw)
+
+
 def _pick_encoding(raw):
     """'ascii' | 'utf-16le' | 'utf-8' | None for one chunk of text-run bytes.
 
     Order matters. UTF-16LE ASCII text is also valid UTF-8 (NUL is a legal code
     point), so a NUL-rich chunk is claimed for UTF-16LE first; otherwise the
-    chunk is UTF-8 if it decodes strictly. Returning None hands the window back
-    to the generic per-window path.
+    chunk is UTF-8 if it decodes strictly AND its decoded text is not dominated
+    by control characters. That second test is what keeps non-Latin UTF-16LE
+    (Arabic, Cyrillic, Greek: high byte 0x06/0x04/0x03) from being read as UTF-8
+    and scored at the model floor. Returning None hands the window back to the
+    generic per-window path, which tries both readings and keeps the better one.
     """
     if not raw.translate(None, _ASCII_BYTES):
         return "ascii"
@@ -538,7 +597,8 @@ def _pick_encoding(raw):
         return "utf-16le"
     try:
         raw.decode("utf-8")
-        return "utf-8"
+        if _ctl_frac(raw) <= _CTL_MAX:
+            return "utf-8"
     except (UnicodeDecodeError, ValueError):
         pass
     if len(raw) % 2 == 0 and _hi_nonnul_ratio(raw) >= 0.90:
@@ -638,8 +698,9 @@ def _make_scorer(data, start, end, model):
     mode = _pick_encoding(data[start:end])
     if mode is None:
         return None
-    if mode == "utf-16le" and start % 2:
-        return None                  # code units would be misaligned
+    # No parity guard: `raw.decode("utf-16-le")` reads consecutive byte pairs from
+    # wherever the chunk starts, so an odd-aligned run decodes correctly as long
+    # as the scorer is built at that same offset (it is).
     try:
         return _RunScorer(data, start, end, mode, model)
     except (UnicodeDecodeError, ValueError):

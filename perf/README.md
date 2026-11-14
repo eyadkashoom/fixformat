@@ -44,6 +44,18 @@ trigram model per character, not the input size, and peak RSS at these sizes is
 already set by the corpus itself (scan adds 0.0 MiB). A number below 1 MiB is
 therefore a cache effect, not a leak.
 
+### Cost of the two-parity UTF-16 prefilter
+
+A UTF-16LE run can begin at an odd byte offset, so `_text_runs` masks both
+parities. That is one extra C-level translate over the 4 MiB slice plus the
+windows it exposes, and it is not free: on the 10 MiB mixed corpus the measured
+throughput moved from **20.3 to 14.9 MiB/s** (25% less), and noise from 20.3 to
+15.4 MiB/s. Both stay above the published target of 10 MiB/s, and the recall it
+buys is covered by `fixtures/edge_cases/misaligned_utf16le.bin` and
+`fixtures/positive/utf8_arabic.txt`. If the margin is ever needed back, the
+second pass is the knob - but dropping it silently loses every odd-aligned
+UTF-16 run.
+
 ## How to reproduce
 
 ```bash

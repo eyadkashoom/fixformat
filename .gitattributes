@@ -1,0 +1,6 @@
+# Golden fixtures are byte-exact reference data. Git's end-of-line conversion
+# would rewrite LF to CRLF on checkout under core.autocrlf=true and invalidate
+# every recorded SHA-256, so they are marked binary and never normalised.
+fixtures/** -text
+fixtures/**/*.bin binary
+fixtures/**/*.txt -text
